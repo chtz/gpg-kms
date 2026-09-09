@@ -1,0 +1,12 @@
+# Private key material (GnuPG homes with secret keys and local pubkey exports)
+/keys/
+
+# Signatures and extra artifacts written by the sign-and-verify testrun
+/test-out/
+/gpg-work/
+
+# Editor / OS junk
+.DS_Store
+*.swp
+temp
+keyring
