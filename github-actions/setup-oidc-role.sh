@@ -17,10 +17,11 @@ GITHUB_OIDC_THUMBPRINTS=("6938fd4d98bab03faadb97b34396831e3780aea1" "1c58a3a8518
 INLINE_POLICY_NAME="invoke-kmslambda"
 
 usage() {
-  echo "Usage: $0 [--repo OWNER/REPO] [--role-name NAME] [--function LAMBDA]" >&2
+  echo "Usage: $0 [--repo OWNER/REPO] [--role-name NAME] [--function LAMBDA] [--owner-id ID] [--repo-id ID]" >&2
   echo "Env: AWS_PROFILE, AWS_REGION, GITHUB_REPOSITORY, AWS_ROLE_NAME, KMSPGP_LAMBDA_FUNCTION_NAME" >&2
   echo "Default role name: gha-gpg-kms-release" >&2
   echo "Source kmslambda/config.sh so KMSPGP_LAMBDA_FUNCTION_NAME is set." >&2
+  echo "Owner/repo IDs default from gh api (required for GitHub immutable OIDC sub)." >&2
   exit 1
 }
 
@@ -33,6 +34,8 @@ while [[ $# -gt 0 ]]; do
     --repo) [[ $# -ge 2 ]] || usage; GITHUB_REPO="$2"; shift 2 ;;
     --role-name) [[ $# -ge 2 ]] || usage; ROLE_NAME="$2"; shift 2 ;;
     --function) [[ $# -ge 2 ]] || usage; FUNCTION="$2"; shift 2 ;;
+    --owner-id) [[ $# -ge 2 ]] || usage; GITHUB_OWNER_ID="$2"; shift 2 ;;
+    --repo-id) [[ $# -ge 2 ]] || usage; GITHUB_REPO_ID="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
@@ -42,6 +45,8 @@ require_cmd python3
 init_aws
 require_account
 resolve_github_repo
+resolve_github_ids
+GITHUB_OIDC_SUB="repo:${GITHUB_OWNER}@${GITHUB_OWNER_ID}/${GITHUB_REPO_NAME}@${GITHUB_REPO_ID}:environment:release"
 
 if [[ ! -f "$TRUST_TEMPLATE" || ! -f "$PERMS_TEMPLATE" ]]; then
   echo "Missing policy templates next to this script." >&2
@@ -59,6 +64,7 @@ OIDC_PROVIDER_ARN="arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${GITHUB_OIDC_HOST}"
 echo "GitHub Actions OIDC role:" >&2
 echo "  profile:  ${PROFILE:-<default>}" >&2
 echo "  repo:     $GITHUB_REPO" >&2
+echo "  sub:      $GITHUB_OIDC_SUB" >&2
 echo "  role:     $ROLE_NAME" >&2
 echo "  region:   $REGION" >&2
 echo "  function: $FUNCTION" >&2
@@ -83,11 +89,18 @@ mkdir -p "$LOCAL_DIR"
 TRUST_OUT="$LOCAL_DIR/trust-policy.applied.json"
 PERMS_OUT="$LOCAL_DIR/permissions-policy.applied.json"
 
-python3 - "$TRUST_TEMPLATE" "$TRUST_OUT" "$OIDC_PROVIDER_ARN" "$GITHUB_REPO" <<'PY'
+python3 - "$TRUST_TEMPLATE" "$TRUST_OUT" "$OIDC_PROVIDER_ARN" \
+  "$GITHUB_OWNER" "$GITHUB_OWNER_ID" "$GITHUB_REPO_NAME" "$GITHUB_REPO_ID" <<'PY'
 import pathlib, sys
-src, dst, oidc, repo = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+src, dst, oidc, owner, owner_id, name, repo_id = sys.argv[1:8]
 text = pathlib.Path(src).read_text()
-text = text.replace("__OIDC_PROVIDER_ARN__", oidc).replace("__GITHUB_REPO__", repo)
+text = (
+    text.replace("__OIDC_PROVIDER_ARN__", oidc)
+    .replace("__GITHUB_OWNER_ID__", owner_id)
+    .replace("__GITHUB_REPO_ID__", repo_id)
+    .replace("__GITHUB_OWNER__", owner)
+    .replace("__GITHUB_REPO_NAME__", name)
+)
 pathlib.Path(dst).write_text(text)
 PY
 

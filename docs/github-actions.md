@@ -80,8 +80,10 @@ Policy JSON lives in [`github-actions/trust-policy.json`](../github-actions/trus
 The trust policy allows `sts:AssumeRoleWithWebIdentity` only when:
 
 - `aud` is `sts.amazonaws.com`
-- `sub` is `repo:OWNER/REPO:environment:release`
+- `sub` is GitHub's **immutable** subject (repos created after 15 Jul 2026): `repo:OWNER@OWNER_ID/REPO@REPO_ID:environment:release`
 - `job_workflow_ref` is `OWNER/REPO/.github/workflows/release-jar.yml@refs/heads/main`
+
+`setup-oidc-role.sh` reads `OWNER_ID` / `REPO_ID` from `gh api` (or `--owner-id` / `--repo-id`). Do not guess the name-only `sub` (`repo:OWNER/REPO:environment:…`); CloudTrail `userIdentity.userName` is the `sub` AWS actually saw. Older GitHub repos that never opted into immutable claims still emit the name-only format — change the template if you are integrating an old repository.
 
 The permissions policy is a single statement: `lambda:InvokeFunction` on the kmslambda function ARN.
 
@@ -165,7 +167,7 @@ Deletes the IAM role and inline policy. Leaves the account-level GitHub OIDC pro
 | Symptom | Likely cause |
 |---------|----------------|
 | SNS email never arrives | Approver not added, or the subscription is still `PendingConfirmation` (`./kmslambda/approvers.sh list`) |
-| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | Trust policy `sub` / `job_workflow_ref` mismatch: wrong repo, environment name, workflow path, or branch other than `main` |
+| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | Trust policy `sub` does not match the token. After 15 Jul 2026 GitHub includes owner/repo IDs (`repo:OWNER@ID/REPO@ID:environment:release`). Re-run `setup-oidc-role.sh`. CloudTrail `userIdentity.userName` is the actual `sub`. Also check `job_workflow_ref` (workflow path and `@refs/heads/main`) |
 | `lambda:InvokeFunction` denied | Permissions policy ARN does not match the function the workflow invokes; re-run `setup-oidc-role.sh` after sourcing `config.sh` |
 | Job hits 40 minutes | Nobody approved; kmslambda poll timeout is 30 minutes |
 | `Live OpenPGP fingerprint does not match` | KMS key was rotated and `keys/signing.pub.asc` was not updated |

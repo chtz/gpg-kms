@@ -72,3 +72,22 @@ resolve_github_repo() {
     exit 1
   fi
 }
+
+# Owner/repo numeric IDs for GitHub's immutable OIDC `sub` (repos created after 15 Jul 2026).
+# CloudTrail userIdentity.userName is the actual `sub` if AssumeRoleWithWebIdentity is denied.
+resolve_github_ids() {
+  GITHUB_OWNER="${GITHUB_OWNER:-${GITHUB_REPO%%/*}}"
+  GITHUB_REPO_NAME="${GITHUB_REPO_NAME:-${GITHUB_REPO#*/}}"
+  if [[ -n "${GITHUB_OWNER_ID:-}" && -n "${GITHUB_REPO_ID:-}" ]]; then
+    return 0
+  fi
+  require_cmd gh
+  local meta
+  meta="$(gh api "repos/${GITHUB_REPO}" --jq '[.owner.login, (.owner.id|tostring), .name, (.id|tostring)] | @tsv')"
+  IFS=$'\t' read -r GITHUB_OWNER GITHUB_OWNER_ID GITHUB_REPO_NAME GITHUB_REPO_ID <<<"$meta"
+  if [[ -z "$GITHUB_OWNER" || -z "$GITHUB_OWNER_ID" || -z "$GITHUB_REPO_NAME" || -z "$GITHUB_REPO_ID" ]]; then
+    echo "Could not read GitHub owner/repo IDs from gh api repos/${GITHUB_REPO}." >&2
+    echo "Pass --owner-id and --repo-id." >&2
+    exit 1
+  fi
+}

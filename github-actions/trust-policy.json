@@ -11,8 +11,8 @@
       "Condition": {
         "StringEquals": {
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-          "token.actions.githubusercontent.com:sub": "repo:__GITHUB_REPO__:environment:release",
-          "token.actions.githubusercontent.com:job_workflow_ref": "__GITHUB_REPO__/.github/workflows/release-jar.yml@refs/heads/main"
+          "token.actions.githubusercontent.com:sub": "repo:__GITHUB_OWNER__@__GITHUB_OWNER_ID__/__GITHUB_REPO_NAME__@__GITHUB_REPO_ID__:environment:release",
+          "token.actions.githubusercontent.com:job_workflow_ref": "__GITHUB_OWNER__/__GITHUB_REPO_NAME__/.github/workflows/release-jar.yml@refs/heads/main"
         }
       }
     }
