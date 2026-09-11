@@ -57,8 +57,6 @@ jobs:
 
       - name: Sign the JAR
         run: |
-          echo "Waiting for kmslambda email approval (up to 30 minutes)."
-          echo "Compare the OpenPGP digest printed next with the approval email."
           ./dist/lambda-sign.sh \
             --function "$KMSPGP_LAMBDA_FUNCTION_NAME" \
             --version "${{ steps.meta.outputs.shortsha }}" \

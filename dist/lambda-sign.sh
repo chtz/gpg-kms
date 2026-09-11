@@ -46,15 +46,13 @@ fi
 
 mkdir -p "$(dirname "$OUTPUT")"
 echo "Signing via kmslambda (approve the SNS link while this waits):"
-echo "  function:  $FUNCTION"
 echo "  artifact:  $ARTIFACT"
 echo "  signature: $OUTPUT"
 [[ -n "$VERSION" ]] && echo "  version:   $VERSION"
 [[ -n "$ENVIRONMENT" ]] && echo "  env:       $ENVIRONMENT"
-echo "The OpenPGP digest KMS will sign is printed next; compare it with the approval email."
 echo
 
-lambda_args=(lambda-sign --function "$FUNCTION" --artifact "$(basename "$ARTIFACT")")
+lambda_args=(lambda-sign --function "$FUNCTION" --artifact "$ARTIFACT")
 if [[ -n "$VERSION" ]]; then
   lambda_args+=(--version "$VERSION")
 fi

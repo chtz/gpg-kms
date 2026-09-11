@@ -12,6 +12,12 @@ import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { ulid } from 'ulid';
 import crypto from 'crypto';
 import { exportCertifiedPublicKey, fingerprintOf, OpenPgpPublicKey } from './openpgp';
+import {
+  ApprovalIdentity,
+  formatFingerprint,
+  isoSeconds,
+  renderApprovalPage,
+} from './approvalPage';
 
 // ---------- Environment ----------
 const {
@@ -99,7 +105,7 @@ const SECURITY_HEADERS = {
   'Cache-Control': 'no-store',
   'Referrer-Policy': 'no-referrer',
   'X-Frame-Options': 'DENY',
-  'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'",
+  'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'",
 };
 
 function jsonResponse(statusCode: number, body: unknown): APIGatewayProxyStructuredResultV2 {
@@ -124,13 +130,53 @@ function htmlResponse(statusCode: number, html: string): APIGatewayProxyStructur
   };
 }
 
-function escapeHtml(input: string): string {
-  return input
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
+function redirectToApprove(token: string): APIGatewayProxyStructuredResultV2 {
+  return {
+    statusCode: 303,
+    headers: {
+      Location: `${API_BASE_URL}/approve?token=${encodeURIComponent(token)}`,
+      ...SECURITY_HEADERS,
+    },
+  };
+}
+
+function openPgpUserId(): string {
+  const name = (OPENPGP_USER_NAME || '').trim();
+  const email = (OPENPGP_USER_EMAIL || '').trim();
+  if (!name || !email) return '';
+  return `${name} <${email}>`;
+}
+
+async function approvalIdentity(): Promise<ApprovalIdentity> {
+  const userId = openPgpUserId();
+  try {
+    return { userId, fingerprint: formatFingerprint(await signingFingerprint()) };
+  } catch {
+    return { userId };
+  }
+}
+
+function approvePage(opts: {
+  token?: string;
+  item?: SignRequestItem | null;
+  error?: string;
+  identity: ApprovalIdentity;
+}): string {
+  return renderApprovalPage({
+    token: opts.token,
+    item: opts.item,
+    error: opts.error,
+    identity: opts.identity,
+    approveAction: `${API_BASE_URL || ''}/approve`,
+  });
+}
+
+function snsSubject(artifact?: string, version?: string): string {
+  const leaf = artifact ? artifact.split('/').filter(Boolean).pop() || artifact : '';
+  const parts = ['Sign', leaf, version].filter((p) => !!p);
+  let subject = parts.join(' ') || 'Sign request';
+  if (subject.length > 100) subject = subject.slice(0, 100);
+  return subject;
 }
 
 function chunk64(s: string): string {
@@ -194,7 +240,11 @@ async function signToken(payload: TokenPayload): Promise<string> {
   return `${toBase64Url(body)}.${toBase64Url(mac)}`;
 }
 
-async function verifyToken(token: string, expectedCap: Capability): Promise<TokenPayload> {
+async function verifyToken(
+  token: string,
+  expectedCap: Capability,
+  opts?: { allowExpired?: boolean }
+): Promise<TokenPayload> {
   const [bodyB64u, sigB64u] = token.split('.');
   if (!bodyB64u || !sigB64u) throw new Error('Malformed token');
   const body = fromBase64Url(bodyB64u);
@@ -205,7 +255,8 @@ async function verifyToken(token: string, expectedCap: Capability): Promise<Toke
   const payload = JSON.parse(body.toString('utf8')) as TokenPayload;
   if (payload.ver !== 1) throw new Error('Unsupported token version');
   if (payload.cap !== expectedCap) throw new Error('Wrong capability');
-  if (typeof payload.exp !== 'number' || payload.exp < nowSeconds()) throw new Error('Token expired');
+  if (typeof payload.exp !== 'number') throw new Error('Token expired');
+  if (payload.exp < nowSeconds() && !opts?.allowExpired) throw new Error('Token expired');
   if (!payload.rid) throw new Error('Missing rid');
   return payload;
 }
@@ -313,25 +364,35 @@ async function createRequest(input: any) {
     pollToken
   )}`;
 
+  const signer = openPgpUserId();
+  let fingerprintLine: string | undefined;
+  try {
+    fingerprintLine = `Fingerprint: ${formatFingerprint(await signingFingerprint())}`;
+  } catch {
+    fingerprintLine = undefined;
+  }
+  const expiresIso = isoSeconds(approvalExpiresAt);
   const messageLines = [
-    `Artifact signing approval requested`,
+    `Request ID: ${requestId}`,
     item.artifact ? `Artifact: ${item.artifact}` : undefined,
     item.version ? `Version: ${item.version}` : undefined,
     item.environment ? `Environment: ${item.environment}` : undefined,
-    `Request ID: ${requestId}`,
+    signer ? `Signer: ${signer}` : undefined,
+    fingerprintLine,
     ``,
-    `KMS will sign this OpenPGP SHA-256 digest (not sha256sum of the file):`,
+    `Digest KMS will sign (must match the sign command):`,
     digestHex,
-    `Hashed signature creation time (unix seconds): ${hashedAt}`,
-    `Compare with the digest printed by kmspgp, or recompute with kmspgp from the artifact and hashedAt.`,
+    `hashedAt: ${isoSeconds(hashedAt)} (${hashedAt})`,
+    `This is not sha256sum of the file.`,
     ``,
-    `Approval link (expires ${new Date(approvalExpiresAt * 1000).toISOString()}):`,
-    `${approvalUrl}`,
+    `Opening the link does not sign.`,
+    `Approval link (expires ${expiresIso}):`,
+    approvalUrl,
   ].filter((line) => line !== undefined) as string[];
   await sns.send(
     new PublishCommand({
       TopicArn: SNS_TOPIC_ARN,
-      Subject: 'Artifact signing approval requested',
+      Subject: snsSubject(item.artifact, item.version),
       Message: messageLines.join('\n'),
     })
   );
@@ -369,73 +430,6 @@ async function getRequest(requestId: string): Promise<SignRequestItem | null> {
   return (out.Item as SignRequestItem) ?? null;
 }
 
-function renderApprovalPage(opts: {
-  ok: boolean;
-  error?: string;
-  token?: string;
-  item?: SignRequestItem | null;
-}): string {
-  const { ok, error, token, item } = opts;
-  const title = 'Artifact Signing Approval';
-  const safeError = error ? escapeHtml(error) : '';
-  const body = ok && item
-    ? `
-    <h1>${title}</h1>
-    <p>Please review the details below. Clicking Approve authorizes a KMS signature of this OpenPGP SHA-256 digest (not sha256sum of the file). GET does not approve.</p>
-    <ul>
-      <li><strong>Request ID:</strong> ${escapeHtml(item.requestId)}</li>
-      ${item.artifact ? `<li><strong>Artifact:</strong> ${escapeHtml(item.artifact)}</li>` : ''}
-      ${item.version ? `<li><strong>Version:</strong> ${escapeHtml(item.version)}</li>` : ''}
-      ${item.environment ? `<li><strong>Environment:</strong> ${escapeHtml(item.environment)}</li>` : ''}
-      ${digestListItems(item)}
-      <li><strong>Status:</strong> ${escapeHtml(item.status)}</li>
-      <li><strong>Created:</strong> ${new Date(item.createdAt * 1000).toISOString()}</li>
-      <li><strong>Expires:</strong> ${new Date(item.expiresAt * 1000).toISOString()}</li>
-    </ul>
-    ${
-      item.status === 'WAITING'
-        ? `
-    <form method="POST" action="${escapeHtml((API_BASE_URL || '') + '/approve')}" style="display:inline-block;margin-right:1rem;">
-      <input type="hidden" name="token" value="${escapeHtml(token || '')}"/>
-      <input type="hidden" name="decision" value="approve"/>
-      <button type="submit" style="padding:0.5rem 1rem;background:#0a7b2f;color:#fff;border:none;border-radius:4px;cursor:pointer;">Approve</button>
-    </form>
-    <form method="POST" action="${escapeHtml((API_BASE_URL || '') + '/approve')}" style="display:inline-block;">
-      <input type="hidden" name="token" value="${escapeHtml(token || '')}"/>
-      <input type="hidden" name="decision" value="reject"/>
-      <button type="submit" style="padding:0.5rem 1rem;background:#b00020;color:#fff;border:none;border-radius:4px;cursor:pointer;">Reject</button>
-    </form>
-    `
-        : `<p>No action available: status is ${escapeHtml(item.status)}.</p>`
-    }
-  `
-    : `
-    <h1>${title}</h1>
-    <p style="color:#b00020;">${safeError || 'Unable to load approval page.'}</p>
-  `;
-  return `<!doctype html>
-  <html lang="en">
-    <head>
-      <meta charset="utf-8"/>
-      <meta name="viewport" content="width=device-width, initial-scale=1"/>
-      <title>${title}</title>
-      <style>
-        body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 2rem; line-height: 1.5; }
-        code { background: #f2f2f2; padding: 0.15rem 0.35rem; border-radius: 3px; }
-      </style>
-    </head>
-    <body>
-      ${body}
-    </body>
-  </html>`;
-}
-
-function digestListItems(item: SignRequestItem): string {
-  return `<li><strong>OpenPGP SHA-256 digest (KMS signs this):</strong> <code>${escapeHtml(item.artifactDigest)}</code></li>
-      <li><strong>Hashed signature creation time:</strong> ${item.hashedAt} (${new Date(item.hashedAt * 1000).toISOString()})</li>
-      <li>This is not <code>sha256sum</code> of the file. Compare with the digest printed by kmspgp, or recompute with kmspgp from the artifact and hashedAt.</li>`;
-}
-
 function parseFormUrlEncoded(body: string): Record<string, string> {
   return body
     .split('&')
@@ -448,32 +442,31 @@ function parseFormUrlEncoded(body: string): Record<string, string> {
 }
 
 async function handleApproveGet(event: any) {
+  const identity = await approvalIdentity();
   try {
     const token = event.queryStringParameters?.token || '';
     if (!token) {
-      return htmlResponse(400, renderApprovalPage({ ok: false, error: 'Missing token' }));
+      return htmlResponse(400, approvePage({ error: 'Missing token', identity }));
     }
     let payload: TokenPayload;
     try {
-      payload = await verifyToken(token, 'approve');
+      payload = await verifyToken(token, 'approve', { allowExpired: true });
     } catch (e: any) {
-      return htmlResponse(400, renderApprovalPage({ ok: false, error: e.message || 'Invalid token' }));
+      return htmlResponse(400, approvePage({ error: e.message || 'Invalid token', identity }));
     }
     const item = await getRequest(payload.rid);
     if (!item) {
-      return htmlResponse(404, renderApprovalPage({ ok: false, error: 'Request not found' }));
+      return htmlResponse(404, approvePage({ error: 'Request not found', identity }));
     }
-    if (item.expiresAt < nowSeconds()) {
-      return htmlResponse(400, renderApprovalPage({ ok: false, error: 'Request expired' }));
-    }
-    return htmlResponse(200, renderApprovalPage({ ok: true, token, item }));
+    return htmlResponse(200, approvePage({ token, item, identity }));
   } catch (err: any) {
     console.error(JSON.stringify({ level: 'error', msg: 'approve GET failed', error: err?.message }));
-    return htmlResponse(500, renderApprovalPage({ ok: false, error: 'Internal error' }));
+    return htmlResponse(500, approvePage({ error: 'Internal error', identity }));
   }
 }
 
 async function handleApprovePost(event: any) {
+  const identity = await approvalIdentity();
   try {
     const isBase64 = !!event.isBase64Encoded;
     const raw = isBase64 ? Buffer.from(event.body || '', 'base64').toString('utf8') : event.body || '';
@@ -495,23 +488,23 @@ async function handleApprovePost(event: any) {
       decision = (form['decision'] || '').toLowerCase();
     }
     if (!token) {
-      return htmlResponse(400, renderApprovalPage({ ok: false, error: 'Missing token' }));
+      return htmlResponse(400, approvePage({ error: 'Missing token', identity }));
     }
     let payload: TokenPayload;
     try {
       payload = await verifyToken(token, 'approve');
     } catch (e: any) {
-      return htmlResponse(400, renderApprovalPage({ ok: false, error: e.message || 'Invalid token' }));
+      if (e.message === 'Token expired') {
+        return redirectToApprove(token);
+      }
+      return htmlResponse(400, approvePage({ error: e.message || 'Invalid token', identity }));
     }
     const item = await getRequest(payload.rid);
     if (!item) {
-      return htmlResponse(404, renderApprovalPage({ ok: false, error: 'Request not found' }));
+      return htmlResponse(404, approvePage({ error: 'Request not found', identity }));
     }
-    if (item.expiresAt < nowSeconds()) {
-      return htmlResponse(400, renderApprovalPage({ ok: false, error: 'Request expired' }));
-    }
-    if (item.status !== 'WAITING') {
-      return htmlResponse(400, renderApprovalPage({ ok: false, error: `Already handled: ${item.status}` }));
+    if (item.status !== 'WAITING' || nowSeconds() > item.approvalExpiresAt) {
+      return redirectToApprove(token);
     }
     const sourceIp: string | undefined = event.requestContext?.http?.sourceIp;
     const now = nowSeconds();
@@ -536,20 +529,12 @@ async function handleApprovePost(event: any) {
           })
         );
       } catch (e: any) {
-        return htmlResponse(
-          409,
-          renderApprovalPage({ ok: false, error: 'Request is no longer waiting or already handled' })
-        );
+        return redirectToApprove(token);
       }
-      return htmlResponse(
-        200,
-        `<!doctype html><html><body><h1>Request Rejected</h1><p>Request ${escapeHtml(
-          item.requestId
-        )} rejected.</p></body></html>`
-      );
+      return redirectToApprove(token);
     }
     if (decision !== 'approve') {
-      return htmlResponse(400, renderApprovalPage({ ok: false, error: 'Invalid decision' }));
+      return htmlResponse(400, approvePage({ error: 'Invalid decision', identity }));
     }
     // WAITING -> SIGNING (claim)
     try {
@@ -570,10 +555,7 @@ async function handleApprovePost(event: any) {
         })
       );
     } catch (e: any) {
-      return htmlResponse(
-        409,
-        renderApprovalPage({ ok: false, error: 'Request is no longer waiting or already handled' })
-      );
+      return redirectToApprove(token);
     }
     // Perform KMS Sign over DIGEST (hex -> bytes)
     let signatureB64 = '';
@@ -640,32 +622,16 @@ async function handleApprovePost(event: any) {
       );
       return htmlResponse(
         500,
-        `<!doctype html><html><body><h1>Failed to Save Signature</h1>
-        <p>Request ${escapeHtml(item.requestId)} was signed but the result was not stored: ${escapeHtml(
-          persistErr?.message || 'DynamoDB update failed'
-        )}</p></body></html>`
+        approvePage({
+          identity,
+          error: `Request ${item.requestId} was signed but the result was not stored.`,
+        })
       );
     }
-    if (finalStatus === 'SIGNED') {
-      return htmlResponse(
-        200,
-        `<!doctype html><html><body><h1>Signature Created</h1>
-        <p>Request ${escapeHtml(item.requestId)} signed successfully.</p>
-        <p>Signature (base64 DER):</p>
-        <pre style="white-space:pre-wrap;word-break:break-all;">${escapeHtml(signatureB64)}</pre>
-        </body></html>`
-      );
-    } else {
-      return htmlResponse(
-        500,
-        `<!doctype html><html><body><h1>Signing Failed</h1>
-        <p>Request ${escapeHtml(item.requestId)} failed: ${escapeHtml(error || '')}</p>
-        </body></html>`
-      );
-    }
+    return redirectToApprove(token);
   } catch (err: any) {
     console.error(JSON.stringify({ level: 'error', msg: 'approve POST failed', error: err?.message }));
-    return htmlResponse(500, renderApprovalPage({ ok: false, error: 'Internal error' }));
+    return htmlResponse(500, approvePage({ error: 'Internal error', identity }));
   }
 }
 

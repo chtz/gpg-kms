@@ -125,7 +125,7 @@ Push the workflow file, this guide, and `keys/signing.pub.asc` to `main` before 
 
 1. On GitHub: **Actions → Release kmspgp.jar → Run workflow** (branch `main`).
 2. The job builds the JAR, checks that the pin has exactly one primary key, then assumes the IAM role.
-3. `lambda-sign.sh --function …` waits up to 30 minutes. The sign step logs the OpenPGP digest and hashed creation time. Approve the SNS email while it waits; compare the digest in the email with that job log. The job timeout is 40 minutes.
+3. `lambda-sign.sh --function …` waits up to 30 minutes. The sign step logs the artifact path, OpenPGP digest, and `hashedAt`. Approve the SNS email while it waits; compare those fields with the job log. The job timeout is 40 minutes.
 4. GitHub Release `kmspgp-<shortsha>` is created with `kmspgp-<shortsha>.jar` and `kmspgp-<shortsha>.jar.asc`. AWS credentials are unset before `gh release create`.
 
 Re-running the same commit fails if the tag already exists. That is intentional: a SHA maps to one Release. If sign succeeded and upload failed, delete the tag/release only when you intend to produce a new signature for the same bytes.
@@ -170,7 +170,7 @@ Deletes the IAM role and inline policy. Leaves the account-level GitHub OIDC pro
 | `Not authorized to perform sts:AssumeRoleWithWebIdentity` | Trust policy `sub` does not match the token. After 15 Jul 2026 GitHub includes owner/repo IDs (`repo:OWNER@ID/REPO@ID:environment:release`). Re-run `setup-oidc-role.sh`. CloudTrail `userIdentity.userName` is the actual `sub`. Also check `job_workflow_ref` (workflow path and `@refs/heads/main`) |
 | `lambda:InvokeFunction` denied | Permissions policy ARN does not match the function the workflow invokes; re-run `setup-oidc-role.sh` after sourcing `config.sh` |
 | Job hits 40 minutes | Nobody approved; kmslambda poll timeout is 30 minutes |
-| Email digest does not match the Actions log | Approve only if they match. Recalculate with kmspgp from the artifact plus `hashedAt` (not `sha256sum`) |
+| Email digest or artifact path does not match the Actions log | Approve only if they match. Recalculate with kmspgp from the artifact plus `hashedAt` (not `sha256sum`) |
 | GnuPG verify fails after a key rotation | `keys/signing.pub.asc` was not updated; re-export and commit the pin |
 | Pin check fails (`exactly one primary OpenPGP key`) | Extra keys in the pin; export a single primary key |
 | Release create fails with tag exists | That commit already has a Release; use a new commit or delete the tag only if you mean to re-sign |

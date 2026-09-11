@@ -123,7 +123,7 @@ WORK=$(mktemp -d)
 **Needs:** `$WORK/env`, the artifact, `dist/kmspgp.jar`. A confirmed approver must click the email link while sign waits.  
 **Permissions:** `lambda:InvokeFunction` only. Not the admin Terraform IAM, not `kms:Sign`.
 
-`lambda-sign` prints the OpenPGP SHA-256 digest KMS will sign (not `sha256sum` of the file) plus the hashed creation time. Compare that with the approval email.
+`lambda-sign` prints the artifact path, OpenPGP SHA-256 digest KMS will sign (not `sha256sum` of the file), and `hashedAt`. Compare those with the approval email.
 
 ```bash
 . "$WORK/env"

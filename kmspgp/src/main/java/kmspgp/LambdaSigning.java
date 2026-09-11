@@ -63,10 +63,10 @@ final class LambdaSigning {
             throw new IllegalStateException("create response missing pollUrl");
         }
         System.err.println("Waiting for approval of request " + (requestId == null ? "?" : requestId));
-        System.err.println("Approve via the SNS link, then this command will continue.");
-        System.err.println("Compare the digest above with the approval email.");
 
-        var deadline = Instant.now().plusSeconds(pollTimeoutSeconds);
+        var waitStarted = Instant.now();
+        var deadline = waitStarted.plusSeconds(pollTimeoutSeconds);
+        var lastHeartbeat = Instant.EPOCH;
         String lastStatus = "";
         while (Instant.now().isBefore(deadline)) {
             var poll = Json.object(httpGet(pollUrl));
@@ -74,8 +74,17 @@ final class LambdaSigning {
                 throw new IllegalStateException(message(poll, "poll failed"));
             }
             var status = Json.str(poll, "status");
-            lastStatus = status == null ? "" : status;
-            System.err.println("Status: " + lastStatus);
+            var nextStatus = status == null ? "" : status;
+            if (!nextStatus.equals(lastStatus)) {
+                lastStatus = nextStatus;
+                lastHeartbeat = Instant.now();
+                System.err.println("Status: " + lastStatus);
+            } else if ("WAITING".equals(lastStatus)
+                    && Duration.between(lastHeartbeat, Instant.now()).toSeconds() >= 30) {
+                lastHeartbeat = Instant.now();
+                System.err.println(
+                        "still waiting, " + Duration.between(waitStarted, Instant.now()).toSeconds() + "s");
+            }
             switch (lastStatus) {
                 case "SIGNED" -> {
                     var signature = Json.str(poll, "signature");

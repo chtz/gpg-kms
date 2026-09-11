@@ -114,9 +114,10 @@ final class Pgp {
         writeUint32(fileDigest, hashedPrefix.length);
         byte[] digest = fileDigest.digest();
 
+        var hashedAtSeconds = hashedAt.getEpochSecond();
         System.err.println("OpenPGP SHA-256 digest (KMS signs this, not sha256sum of the file):");
         System.err.println("  digest:   " + HexFormat.of().formatHex(digest));
-        System.err.println("  hashedAt: " + hashedAt.getEpochSecond() + " (" + hashedAt + ")");
+        System.err.println("  hashedAt: " + hashedAtSeconds + " (" + Instant.ofEpochSecond(hashedAtSeconds) + ")");
 
         var material = signer.sign(digest);
         if (material.fingerprint() == null || material.fingerprint().length != 20) {
