@@ -11,7 +11,7 @@ import { SNSClient, PublishCommand } from '@aws-sdk/client-sns';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { ulid } from 'ulid';
 import crypto from 'crypto';
-import { exportCertifiedPublicKey, OpenPgpPublicKey } from './openpgp';
+import { exportCertifiedPublicKey, fingerprintOf, OpenPgpPublicKey } from './openpgp';
 
 // ---------- Environment ----------
 const {
@@ -68,12 +68,11 @@ type Status = 'WAITING' | 'SIGNING' | 'SIGNED' | 'FAILED' | 'REJECTED';
 interface SignRequestItem {
   requestId: string;
   status: Status;
-  artifactDigest: string; // digest KMS signs (sha256 hex)
-  fileSha256?: string; // optional display-only file hash
+  artifactDigest: string; // OpenPGP SHA-256 digest KMS signs (hex)
+  hashedAt: number; // unix seconds in the hashed signature creation-time subpacket
   artifact?: string;
   version?: string;
   environment?: string;
-  metadata?: Record<string, unknown>;
   createdAt: number; // epoch seconds
   expiresAt: number; // epoch seconds (TTL)
   approvalExpiresAt: number; // epoch seconds
@@ -96,12 +95,19 @@ function isHttpEvent(event: any): boolean {
   return Boolean(event?.requestContext?.http?.method);
 }
 
+const SECURITY_HEADERS = {
+  'Cache-Control': 'no-store',
+  'Referrer-Policy': 'no-referrer',
+  'X-Frame-Options': 'DENY',
+  'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'",
+};
+
 function jsonResponse(statusCode: number, body: unknown): APIGatewayProxyStructuredResultV2 {
   return {
     statusCode,
     headers: {
       'Content-Type': 'application/json; charset=utf-8',
-      'Cache-Control': 'no-store',
+      ...SECURITY_HEADERS,
     },
     body: JSON.stringify(body),
   };
@@ -112,7 +118,7 @@ function htmlResponse(statusCode: number, html: string): APIGatewayProxyStructur
     statusCode,
     headers: {
       'Content-Type': 'text/html; charset=utf-8',
-      'Cache-Control': 'no-store',
+      ...SECURITY_HEADERS,
     },
     body: html,
   };
@@ -213,11 +219,34 @@ function hexToBuffer(hex: string): Buffer {
   return Buffer.from(hex, 'hex');
 }
 
+const ARTIFACT_RE = /^[A-Za-z0-9._@/+:-]{1,256}$/;
+const SHORT_RE = /^[A-Za-z0-9._@/+:-]{1,64}$/;
+
+function optionalAscii(value: unknown, re: RegExp, field: string): { ok: true; value?: string } | { ok: false; error: string; code: string } {
+  if (value == null || value === '') {
+    return { ok: true };
+  }
+  if (typeof value !== 'string' || !re.test(value)) {
+    return {
+      ok: false,
+      error: `Invalid ${field}: expected ASCII matching ${re}`,
+      code: 'BAD_FIELD',
+    };
+  }
+  return { ok: true, value };
+}
+
+function asUnixSeconds(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isInteger(value)) return value;
+  if (typeof value === 'string' && /^-?\d+$/.test(value)) return parseInt(value, 10);
+  return null;
+}
+
 async function createRequest(input: any) {
   if (!TABLE_NAME || !KMS_KEY_ID || !SNS_TOPIC_ARN || !API_BASE_URL) {
     throw new Error('Service not configured (env vars missing)');
   }
-  const { digest, fileSha256, artifact, version, environment, metadata } = input || {};
+  const { digest, hashedAt: hashedAtRaw, artifact, version, environment } = input || {};
   if (!digest || typeof digest !== 'string' || !isHexSha256(digest)) {
     return {
       ok: false,
@@ -225,31 +254,35 @@ async function createRequest(input: any) {
       code: 'BAD_DIGEST',
     };
   }
-  if (fileSha256 != null && fileSha256 !== '') {
-    if (typeof fileSha256 !== 'string' || !isHexSha256(fileSha256)) {
-      return {
-        ok: false,
-        error: 'Invalid fileSha256: expected 64-char hex SHA-256',
-        code: 'BAD_FILE_SHA256',
-      };
-    }
+  const hashedAt = asUnixSeconds(hashedAtRaw);
+  if (hashedAt == null || hashedAt < 946684800 || hashedAt > nowSeconds() + 86400) {
+    return {
+      ok: false,
+      error: 'Invalid or missing hashedAt: expected unix seconds of the OpenPGP hashed creation time',
+      code: 'BAD_HASHED_AT',
+    };
   }
+  const artifactR = optionalAscii(artifact, ARTIFACT_RE, 'artifact');
+  if (!artifactR.ok) return artifactR;
+  const versionR = optionalAscii(version, SHORT_RE, 'version');
+  if (!versionR.ok) return versionR;
+  const environmentR = optionalAscii(environment, SHORT_RE, 'environment');
+  if (!environmentR.ok) return environmentR;
+
   const requestId = ulid();
   const createdAt = nowSeconds();
   const expiresAt = createdAt + REQUEST_TTL_SECONDS;
   const approvalExpiresAt = createdAt + APPROVAL_TTL_SECONDS;
-  const fileHash =
-    typeof fileSha256 === 'string' && fileSha256 !== '' ? fileSha256.toLowerCase() : undefined;
+  const digestHex = digest.toLowerCase();
 
   const item: SignRequestItem = {
     requestId,
     status: 'WAITING',
-    artifactDigest: digest.toLowerCase(),
-    fileSha256: fileHash,
-    artifact,
-    version,
-    environment,
-    metadata,
+    artifactDigest: digestHex,
+    hashedAt,
+    artifact: artifactR.value,
+    version: versionR.value,
+    environment: environmentR.value,
     createdAt,
     expiresAt,
     approvalExpiresAt,
@@ -280,20 +313,21 @@ async function createRequest(input: any) {
     pollToken
   )}`;
 
-  // Publish approval notification via SNS (do not log token/URL)
-  const digestLines = fileHash
-    ? [`File SHA-256: ${fileHash}`, `Signing digest: ${digest.toLowerCase()}`]
-    : [`SHA-256: ${digest.toLowerCase()}`];
   const messageLines = [
     `Artifact signing approval requested`,
-    artifact ? `Artifact: ${artifact}` : undefined,
-    version ? `Version: ${version}` : undefined,
-    environment ? `Environment: ${environment}` : undefined,
+    item.artifact ? `Artifact: ${item.artifact}` : undefined,
+    item.version ? `Version: ${item.version}` : undefined,
+    item.environment ? `Environment: ${item.environment}` : undefined,
     `Request ID: ${requestId}`,
-    ...digestLines,
+    ``,
+    `KMS will sign this OpenPGP SHA-256 digest (not sha256sum of the file):`,
+    digestHex,
+    `Hashed signature creation time (unix seconds): ${hashedAt}`,
+    `Compare with the digest printed by kmspgp, or recompute with kmspgp from the artifact and hashedAt.`,
+    ``,
     `Approval link (expires ${new Date(approvalExpiresAt * 1000).toISOString()}):`,
     `${approvalUrl}`,
-  ].filter(Boolean) as string[];
+  ].filter((line) => line !== undefined) as string[];
   await sns.send(
     new PublishCommand({
       TopicArn: SNS_TOPIC_ARN,
@@ -347,7 +381,7 @@ function renderApprovalPage(opts: {
   const body = ok && item
     ? `
     <h1>${title}</h1>
-    <p>Please review the artifact details below. Clicking Approve authorizes a KMS signature for this ${item.fileSha256 ? 'signing digest' : 'exact SHA-256 digest'}. GET does not approve.</p>
+    <p>Please review the details below. Clicking Approve authorizes a KMS signature of this OpenPGP SHA-256 digest (not sha256sum of the file). GET does not approve.</p>
     <ul>
       <li><strong>Request ID:</strong> ${escapeHtml(item.requestId)}</li>
       ${item.artifact ? `<li><strong>Artifact:</strong> ${escapeHtml(item.artifact)}</li>` : ''}
@@ -397,11 +431,9 @@ function renderApprovalPage(opts: {
 }
 
 function digestListItems(item: SignRequestItem): string {
-  if (item.fileSha256) {
-    return `<li><strong>File SHA-256:</strong> <code>${escapeHtml(item.fileSha256)}</code></li>
-      <li><strong>Signing digest:</strong> <code>${escapeHtml(item.artifactDigest)}</code></li>`;
-  }
-  return `<li><strong>SHA-256:</strong> <code>${escapeHtml(item.artifactDigest)}</code></li>`;
+  return `<li><strong>OpenPGP SHA-256 digest (KMS signs this):</strong> <code>${escapeHtml(item.artifactDigest)}</code></li>
+      <li><strong>Hashed signature creation time:</strong> ${item.hashedAt} (${new Date(item.hashedAt * 1000).toISOString()})</li>
+      <li>This is not <code>sha256sum</code> of the file. Compare with the digest printed by kmspgp, or recompute with kmspgp from the artifact and hashedAt.</li>`;
 }
 
 function parseFormUrlEncoded(body: string): Record<string, string> {
@@ -663,19 +695,17 @@ async function handleGetRequestStatus(event: any) {
       requestId: item.requestId,
       status: item.status,
       artifactDigest: item.artifactDigest,
+      hashedAt: item.hashedAt,
       artifact: item.artifact,
       version: item.version,
       environment: item.environment,
       createdAt: item.createdAt,
       expiresAt: item.expiresAt,
     };
-    if (item.fileSha256) {
-      response.fileSha256 = item.fileSha256;
-    }
     if (item.status === 'SIGNED' && item.signature) {
       response.signature = item.signature;
       response.signingAlgorithm = item.algorithm || 'ECDSA_SHA_256';
-      response.publicKeyUrl = `${API_BASE_URL}/public-key`;
+      response.fingerprint = await signingFingerprint();
     }
     if (item.status === 'FAILED' && item.error) {
       response.error = item.error;
@@ -692,12 +722,9 @@ async function handleGetRequestStatus(event: any) {
 
 interface PublicKeyInfo {
   pem: string;
-  keySpec?: string;
-  signingAlgorithms?: string[];
-  keyUsage?: string;
   creationDate: Date;
   description?: string;
-  arn?: string;
+  fingerprint: string;
 }
 
 let cachedPublicKey: PublicKeyInfo | null = null;
@@ -714,83 +741,54 @@ async function loadPublicKey(): Promise<PublicKeyInfo> {
   const created = des.KeyMetadata?.CreationDate;
   if (!created) throw new Error('KMS key has no creation date');
   const b64 = Buffer.from(publicKeyDer).toString('base64');
+  const pem = `-----BEGIN PUBLIC KEY-----\n${chunk64(b64)}\n-----END PUBLIC KEY-----\n`;
   cachedPublicKey = {
-    pem: `-----BEGIN PUBLIC KEY-----\n${chunk64(b64)}\n-----END PUBLIC KEY-----\n`,
-    keySpec: pub.KeySpec,
-    signingAlgorithms: pub.SigningAlgorithms as string[] | undefined,
-    keyUsage: pub.KeyUsage,
+    pem,
     creationDate: created,
     description: des.KeyMetadata?.Description,
-    arn: des.KeyMetadata?.Arn,
+    fingerprint: fingerprintOf(pem, created),
   };
   return cachedPublicKey;
 }
 
-function publicKeyJson(info: PublicKeyInfo) {
-  return {
-    ok: true,
-    keyId: KMS_KEY_ID,
-    publicKeyPem: info.pem,
-    keySpec: info.keySpec,
-    signingAlgorithms: info.signingAlgorithms,
-    keyUsage: info.keyUsage,
-    creationDate: info.creationDate.toISOString(),
-    description: info.description,
-    arn: info.arn,
-  };
-}
-
-async function handleGetPublicKey() {
-  try {
-    const info = await loadPublicKey();
-    return jsonResponse(200, publicKeyJson(info));
-  } catch (err: any) {
-    console.error(JSON.stringify({ level: 'error', msg: 'public-key failed', error: err?.message }));
-    return jsonResponse(500, { ok: false, error: 'Internal error' });
-  }
+async function signingFingerprint(): Promise<string> {
+  return (await loadPublicKey()).fingerprint;
 }
 
 const openPgpCache = new Map<string, OpenPgpPublicKey>();
 
-async function handleGetOpenPgpPublicKey() {
-  try {
-    const userName = (OPENPGP_USER_NAME || '').trim();
-    const userEmail = (OPENPGP_USER_EMAIL || '').trim();
-    if (!userName || !userEmail) {
-      return jsonResponse(500, { ok: false, error: 'OpenPGP user id is not configured' });
-    }
-    const info = await loadPublicKey();
-    let userId = `${userName} <${userEmail}>`;
-    if (info.description && info.description.trim()) {
-      userId += ` (${info.description.trim()})`;
-    }
-    const cached = openPgpCache.get(userId);
-    if (cached) {
-      return jsonResponse(200, { ok: true, ...cached });
-    }
-    const exported = await exportCertifiedPublicKey({
-      publicKeyPem: info.pem,
-      createdAt: info.creationDate,
-      userId,
-      signDigest: async (digest) => {
-        const signOut = await kms.send(
-          new SignCommand({
-            KeyId: KMS_KEY_ID!,
-            Message: digest,
-            MessageType: 'DIGEST',
-            SigningAlgorithm: 'ECDSA_SHA_256',
-          })
-        );
-        if (!signOut.Signature) throw new Error('KMS returned no signature');
-        return Buffer.from(signOut.Signature);
-      },
-    });
-    openPgpCache.set(userId, exported);
-    return jsonResponse(200, { ok: true, ...exported });
-  } catch (err: any) {
-    console.error(JSON.stringify({ level: 'error', msg: 'openpgp-public-key failed', error: err?.message }));
-    return jsonResponse(500, { ok: false, error: 'Internal error' });
+async function exportOpenPgp(): Promise<OpenPgpPublicKey> {
+  const userName = (OPENPGP_USER_NAME || '').trim();
+  const userEmail = (OPENPGP_USER_EMAIL || '').trim();
+  if (!userName || !userEmail) {
+    throw new Error('OpenPGP user id is not configured');
   }
+  const info = await loadPublicKey();
+  let userId = `${userName} <${userEmail}>`;
+  if (info.description && info.description.trim()) {
+    userId += ` (${info.description.trim()})`;
+  }
+  const cached = openPgpCache.get(userId);
+  if (cached) return cached;
+  const exported = await exportCertifiedPublicKey({
+    publicKeyPem: info.pem,
+    createdAt: info.creationDate,
+    userId,
+    signDigest: async (digest) => {
+      const signOut = await kms.send(
+        new SignCommand({
+          KeyId: KMS_KEY_ID!,
+          Message: digest,
+          MessageType: 'DIGEST',
+          SigningAlgorithm: 'ECDSA_SHA_256',
+        })
+      );
+      if (!signOut.Signature) throw new Error('KMS returned no signature');
+      return Buffer.from(signOut.Signature);
+    },
+  });
+  openPgpCache.set(userId, exported);
+  return exported;
 }
 
 function httpPath(event: any): string {
@@ -823,26 +821,24 @@ async function handleHttp(event: any): Promise<APIGatewayProxyStructuredResultV2
     }
     return handleGetRequestStatus(event);
   }
-  if (routeKey === 'GET /public-key' || (method === 'GET' && path === '/public-key')) {
-    return handleGetPublicKey();
-  }
-  if (
-    routeKey === 'GET /openpgp-public-key' ||
-    (method === 'GET' && path === '/openpgp-public-key')
-  ) {
-    return handleGetOpenPgpPublicKey();
-  }
   return jsonResponse(404, { ok: false, error: 'Not found' });
 }
 
-// ---------- Lambda Invoke (create) ----------
+// ---------- Lambda Invoke (create / export) ----------
 async function handleInvoke(event: any) {
   const action = event?.action;
-  if (action !== 'create') {
-    return { ok: false, error: 'Unsupported action', supported: ['create'] };
+  if (action === 'export') {
+    try {
+      const exported = await exportOpenPgp();
+      return { ok: true, ...exported };
+    } catch (e: any) {
+      return { ok: false, error: e?.message || 'export failed' };
+    }
   }
-  const result = await createRequest(event);
-  return result;
+  if (action !== 'create') {
+    return { ok: false, error: 'Unsupported action', supported: ['create', 'export'] };
+  }
+  return createRequest(event);
 }
 
 // ---------- Handler ----------

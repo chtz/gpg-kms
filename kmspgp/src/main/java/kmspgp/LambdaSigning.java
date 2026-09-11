@@ -22,53 +22,23 @@ import java.util.Map;
 final class LambdaSigning {
     private LambdaSigning() {}
 
-    record PublicKey(
-            String pem,
-            byte[] spki,
-            String keySpec,
-            Instant createdAt,
-            String description
-    ) {}
-
-    static PublicKey fetchPublicKey(String apiBaseUrl) throws Exception {
-        var body = httpGet(join(apiBaseUrl, "/public-key"));
-        var json = Json.object(body);
+    static String exportPublicKey(String functionName) throws Exception {
+        var payload = Map.of("action", "export");
+        var json = invoke(functionName, payload);
         if (!Json.bool(json, "ok")) {
-            throw new IllegalStateException(message(json, "public-key request failed"));
-        }
-        var pem = Json.str(json, "publicKeyPem");
-        var spec = Json.str(json, "keySpec");
-        var created = Json.str(json, "creationDate");
-        if (pem == null || pem.isBlank()) {
-            throw new IllegalStateException("public-key response missing publicKeyPem");
-        }
-        if (created == null || created.isBlank()) {
-            throw new IllegalStateException("public-key response missing creationDate");
-        }
-        return new PublicKey(
-                pem,
-                pemToDer(pem),
-                spec,
-                Instant.parse(created),
-                Json.str(json, "description"));
-    }
-
-    static String fetchOpenPgpPublicKey(String apiBaseUrl) throws Exception {
-        var json = Json.object(httpGet(join(apiBaseUrl, "/openpgp-public-key")));
-        if (!Json.bool(json, "ok")) {
-            throw new IllegalStateException(message(json, "openpgp-public-key request failed"));
+            throw new IllegalStateException(message(json, "export failed"));
         }
         var armored = Json.str(json, "armored");
         if (armored == null || armored.isBlank()) {
-            throw new IllegalStateException("openpgp-public-key response missing armored");
+            throw new IllegalStateException("export response missing armored");
         }
         return armored.stripTrailing();
     }
 
-    static byte[] signDigest(
+    static Pgp.SignatureMaterial signDigest(
             String functionName,
             byte[] digest,
-            String fileSha256,
+            Instant hashedAt,
             String artifact,
             String version,
             String environment,
@@ -78,25 +48,12 @@ final class LambdaSigning {
         var payload = new LinkedHashMap<String, Object>();
         payload.put("action", "create");
         payload.put("digest", HexFormat.of().formatHex(digest));
-        payload.put("fileSha256", fileSha256);
+        payload.put("hashedAt", hashedAt.getEpochSecond());
         payload.put("artifact", artifact);
         payload.put("version", version);
         payload.put("environment", environment);
-        payload.put("metadata", Map.of("format", "openpgp"));
 
-        String responseJson;
-        try (var lambda = lambda()) {
-            var invoke = lambda.invoke(InvokeRequest.builder()
-                    .functionName(functionName)
-                    .payload(SdkBytes.fromUtf8String(Json.stringify(payload)))
-                    .build());
-            if (invoke.functionError() != null) {
-                throw new IllegalStateException("Lambda error: " + invoke.functionError()
-                        + " " + invoke.payload().asUtf8String());
-            }
-            responseJson = invoke.payload().asUtf8String();
-        }
-        var created = Json.object(responseJson);
+        var created = invoke(functionName, payload);
         if (!Json.bool(created, "ok")) {
             throw new IllegalStateException(message(created, "create failed"));
         }
@@ -107,6 +64,7 @@ final class LambdaSigning {
         }
         System.err.println("Waiting for approval of request " + (requestId == null ? "?" : requestId));
         System.err.println("Approve via the SNS link, then this command will continue.");
+        System.err.println("Compare the digest above with the approval email.");
 
         var deadline = Instant.now().plusSeconds(pollTimeoutSeconds);
         String lastStatus = "";
@@ -121,10 +79,16 @@ final class LambdaSigning {
             switch (lastStatus) {
                 case "SIGNED" -> {
                     var signature = Json.str(poll, "signature");
+                    var fingerprint = Json.str(poll, "fingerprint");
                     if (signature == null || signature.isBlank()) {
                         throw new IllegalStateException("SIGNED response missing signature");
                     }
-                    return Base64.getDecoder().decode(signature);
+                    if (fingerprint == null || !fingerprint.matches("(?i)[0-9a-f]{40}")) {
+                        throw new IllegalStateException("SIGNED response missing fingerprint");
+                    }
+                    return new Pgp.SignatureMaterial(
+                            Base64.getDecoder().decode(signature),
+                            HexFormat.of().parseHex(fingerprint));
                 }
                 case "FAILED" -> throw new IllegalStateException(message(poll, "signing failed"));
                 case "REJECTED" -> throw new IllegalStateException(
@@ -139,11 +103,21 @@ final class LambdaSigning {
                         + (lastStatus.isBlank() ? "unknown" : lastStatus) + ")");
     }
 
-    static byte[] pemToDer(String pem) {
-        var b64 = pem.replace("-----BEGIN PUBLIC KEY-----", "")
-                .replace("-----END PUBLIC KEY-----", "")
-                .replaceAll("\\s", "");
-        return Base64.getDecoder().decode(b64);
+    private static Map<String, Object> invoke(String functionName, Map<String, ?> payload)
+            throws Exception {
+        String responseJson;
+        try (var lambda = lambda()) {
+            var invoke = lambda.invoke(InvokeRequest.builder()
+                    .functionName(functionName)
+                    .payload(SdkBytes.fromUtf8String(Json.stringify(payload)))
+                    .build());
+            if (invoke.functionError() != null) {
+                throw new IllegalStateException("Lambda error: " + invoke.functionError()
+                        + " " + invoke.payload().asUtf8String());
+            }
+            responseJson = invoke.payload().asUtf8String();
+        }
+        return Json.object(responseJson);
     }
 
     private static String httpGet(String url) throws Exception {
@@ -166,13 +140,6 @@ final class LambdaSigning {
                 .region(DefaultAwsRegionProviderChain.builder().build().getRegion())
                 .httpClient(UrlConnectionHttpClient.create())
                 .build();
-    }
-
-    private static String join(String base, String path) {
-        if (base.endsWith("/")) {
-            return base.substring(0, base.length() - 1) + path;
-        }
-        return base + path;
     }
 
     private static String message(Map<String, Object> json, String fallback) {

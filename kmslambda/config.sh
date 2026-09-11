@@ -21,5 +21,6 @@ LAMBDA_FUNCTION_NAME="$(tf_output lambda_function_name)"
 cat <<EOF
 export AWS_REGION=$(printf '%q' "$REGION")
 export KMSPGP_LAMBDA_FUNCTION_NAME=$(printf '%q' "$LAMBDA_FUNCTION_NAME")
+# Informational: HTTP base for /approve and poll URLs. Export and sign use --function, not this URL.
 export KMSPGP_LAMBDA_API_BASE_URL=$(printf '%q' "$API_BASE_URL")
 EOF

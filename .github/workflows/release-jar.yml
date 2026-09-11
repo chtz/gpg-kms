@@ -19,10 +19,11 @@ jobs:
     env:
       AWS_REGION: ${{ vars.AWS_REGION }}
       KMSPGP_LAMBDA_FUNCTION_NAME: ${{ vars.KMSPGP_LAMBDA_FUNCTION_NAME }}
-      KMSPGP_LAMBDA_API_BASE_URL: ${{ vars.KMSPGP_LAMBDA_API_BASE_URL }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: Set release metadata
         id: meta
@@ -44,31 +45,8 @@ jobs:
       - name: Name the release artifact
         run: cp dist/kmspgp.jar "dist/kmspgp-${{ steps.meta.outputs.shortsha }}.jar"
 
-      - name: Check live public key matches pin
-        run: |
-          # Armor bytes change on every export (ECDSA self-sig is non-deterministic).
-          # The pin is the same key iff fingerprints match.
-          fingerprint() {
-            gpg --batch --with-colons --show-keys "$1" \
-              | awk -F: '/^fpr:/{print toupper($10); exit}'
-          }
-          pinned="keys/signing.pub.asc"
-          live="$(mktemp)"
-          ./dist/lambda-export.sh --api "$KMSPGP_LAMBDA_API_BASE_URL" --out "$live"
-          pinned_fpr="$(fingerprint "$pinned")"
-          live_fpr="$(fingerprint "$live")"
-          if [[ -z "$pinned_fpr" || -z "$live_fpr" ]]; then
-            echo "Could not read OpenPGP fingerprint from pin or live export." >&2
-            exit 1
-          fi
-          echo "pinned: $pinned_fpr"
-          echo "live:   $live_fpr"
-          if [[ "$pinned_fpr" != "$live_fpr" ]]; then
-            echo "Live OpenPGP fingerprint does not match ${pinned}." >&2
-            echo "Re-export and commit the pin after key rotation." >&2
-            exit 1
-          fi
-          echo "Pinned public key fingerprint matches the live kmslambda key."
+      - name: Check pinned public key
+        run: ./verify.sh --check-pin keys/signing.pub.asc
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
@@ -80,21 +58,21 @@ jobs:
       - name: Sign the JAR
         run: |
           echo "Waiting for kmslambda email approval (up to 30 minutes)."
+          echo "Compare the OpenPGP digest printed next with the approval email."
           ./dist/lambda-sign.sh \
             --function "$KMSPGP_LAMBDA_FUNCTION_NAME" \
-            --api "$KMSPGP_LAMBDA_API_BASE_URL" \
             --version "${{ steps.meta.outputs.shortsha }}" \
             --environment github-release \
             "dist/kmspgp-${{ steps.meta.outputs.shortsha }}.jar" \
             "dist/kmspgp-${{ steps.meta.outputs.shortsha }}.jar.asc"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: kmspgp-${{ steps.meta.outputs.shortsha }}
-          name: kmspgp ${{ steps.meta.outputs.shortsha }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
-            dist/kmspgp-${{ steps.meta.outputs.shortsha }}.jar
-            dist/kmspgp-${{ steps.meta.outputs.shortsha }}.jar.asc
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          unset ${!AWS_*}
+          gh release create "kmspgp-${{ steps.meta.outputs.shortsha }}" \
+            --title "kmspgp ${{ steps.meta.outputs.shortsha }}" \
+            --generate-notes \
+            "dist/kmspgp-${{ steps.meta.outputs.shortsha }}.jar" \
+            "dist/kmspgp-${{ steps.meta.outputs.shortsha }}.jar.asc"

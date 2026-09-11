@@ -17,6 +17,13 @@ const SUB_SIGNER_USER_ID = 28;
 const SUB_ISSUER_FINGERPRINT = 33;
 const SECP256R1_OID = Buffer.from('2A8648CE3D030107', 'hex');
 
+export function fingerprintOf(publicKeyPem: string, createdAt: Date): string {
+  const createdAtSeconds = Math.floor(createdAt.getTime() / 1000);
+  const point = uncompressedPoint(publicKeyPem);
+  const keyBody = publicKeyPacketBody(createdAtSeconds, point);
+  return keyFingerprint(keyBody).toString('hex').toUpperCase();
+}
+
 export interface OpenPgpPublicKey {
   armored: string;
   fingerprint: string;

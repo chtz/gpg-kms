@@ -7,7 +7,7 @@ This repository's `Release kmspgp.jar` workflow is the worked example. The same 
 ## What you get
 
 - A **manual** workflow (`workflow_dispatch`) that builds `kmspgp-<shortsha>.jar`, waits for kmslambda approval, and publishes two GitHub Release assets: the JAR and its detached OpenPGP signature (`.asc`).
-- A **pinned** OpenPGP public key at [`keys/signing.pub.asc`](../keys/signing.pub.asc). That file is the root of trust. It is not attached to each Release; it changes only when the KMS signing key is rotated.
+- A **pinned** OpenPGP public key at [`keys/signing.pub.asc`](../keys/signing.pub.asc). That file is the root of trust. It is not attached to each Release; it changes only when the KMS signing key is rotated. The workflow checks that the pin contains **exactly one** primary key; it does not fetch a live key.
 - Least-privilege AWS access: GitHub Environment `release` on `main`, plus an IAM trust policy that allows **only** [`.github/workflows/release-jar.yml`](../.github/workflows/release-jar.yml) to assume the role.
 
 ## Trust model
@@ -16,7 +16,7 @@ Three actors, three credential sets:
 
 | Actor | Credentials | What they do |
 |-------|-------------|--------------|
-| **Admin** | Broad AWS (Terraform + IAM) and GitHub admin | Deploy kmslambda, export and commit the public key, create the OIDC role, set GitHub Environment values |
+| **Admin** | Broad AWS (Terraform + IAM) and GitHub admin | Deploy kmslambda, invoke-export and commit the public key, create the OIDC role, set GitHub Environment values |
 | **Signing pipeline** | GitHub OIDC → IAM role | `lambda:InvokeFunction` only. Cannot create keys, cannot call `kms:Sign` |
 | **Verifier** | None | GnuPG + `keys/signing.pub.asc` + the JAR and `.asc` from the GitHub Release |
 
@@ -51,31 +51,32 @@ mkdir -p github-actions/.local
 . github-actions/.local/kmslambda.env
 ```
 
-`github-actions/.local/` is gitignored. `config.sh` prints `AWS_REGION`, `KMSPGP_LAMBDA_FUNCTION_NAME`, and `KMSPGP_LAMBDA_API_BASE_URL`. Do not commit those values.
+`github-actions/.local/` is gitignored. `config.sh` prints `AWS_REGION`, `KMSPGP_LAMBDA_FUNCTION_NAME`, and informational `KMSPGP_LAMBDA_API_BASE_URL` (approve/poll HTTP). Do not commit those values.
 
 Details: [README — Approval service](../README.md#approval-service).
 
 ## 2. Pin the OpenPGP public key
 
-Admin step. Repeat only when the KMS key is rotated (new kmslambda key).
+Admin step. Repeat only when the KMS key is rotated (new kmslambda key). Export is a Lambda invoke (`lambda:InvokeFunction`), not an HTTP GET.
 
 ```bash
 ./kmspgp/build.sh   # once, so dist/kmspgp.jar exists for the export wrapper
 . github-actions/.local/kmslambda.env
 
 mkdir -p keys
-./dist/lambda-export.sh --api "$KMSPGP_LAMBDA_API_BASE_URL" \
+./dist/lambda-export.sh --function "$KMSPGP_LAMBDA_FUNCTION_NAME" \
   --out keys/signing.pub.asc
+./verify.sh --check-pin keys/signing.pub.asc
 git add keys/signing.pub.asc
 ```
 
 The armored file contains the OpenPGP User ID (public by design). It does not contain AWS account identifiers.
 
-The release workflow fetches a live export and **fails** if its OpenPGP **fingerprint** differs from this file. Armor bytes are not compared: each export re-signs the self-certification with ECDSA, so the `.asc` text changes even when the key is the same. After a KMS key rotation, commit the new pin before the next signed release.
+The release workflow checks that this pin contains exactly one primary key. It does not fetch a live export. Armor bytes are not compared: each export re-signs the self-certification with ECDSA, so the `.asc` text changes even when the key is the same. After a KMS key rotation, commit the new pin before the next signed release. A stale pin is caught when GnuPG verifies the `.asc`.
 
 ## 3. Create the GitHub OIDC IAM role
 
-Policy JSON lives in [`github-actions/trust-policy.json`](../github-actions/trust-policy.json) and [`github-actions/permissions-policy.json`](../github-actions/permissions-policy.json). Placeholders are filled at runtime; applied copies stay under `github-actions/.local/`.
+Policy JSON lives in [`trust-policy.json`](trust-policy.json) and [`permissions-policy.json`](permissions-policy.json). Placeholders are filled at runtime; applied copies stay under `github-actions/.local/`.
 
 The trust policy allows `sts:AssumeRoleWithWebIdentity` only when:
 
@@ -109,7 +110,6 @@ Creates Environment `release`, restricts deployments to branch `main`, and sets:
 | `AWS_ROLE_ARN` | environment **secret** | `setup-oidc-role.sh` |
 | `AWS_REGION` | environment variable | `kmslambda/config.sh` |
 | `KMSPGP_LAMBDA_FUNCTION_NAME` | environment variable | `kmslambda/config.sh` |
-| `KMSPGP_LAMBDA_API_BASE_URL` | environment variable | `kmslambda/config.sh` |
 
 ```bash
 . github-actions/.local/kmslambda.env
@@ -117,16 +117,16 @@ Creates Environment `release`, restricts deployments to branch `main`, and sets:
 ./github-actions/configure-github.sh --repo OWNER/REPO
 ```
 
-The workflow YAML references only these names. Account IDs, role ARNs, and API URLs do not belong in git.
+The workflow YAML references only these names. Account IDs and role ARNs do not belong in git.
 
 Push the workflow file, this guide, and `keys/signing.pub.asc` to `main` before the first run. The OIDC `job_workflow_ref` claim includes the ref; a run from another branch cannot assume the role.
 
 ## 5. Run a signed release
 
 1. On GitHub: **Actions → Release kmspgp.jar → Run workflow** (branch `main`).
-2. The job builds the JAR, checks the pinned public key, then assumes the IAM role.
-3. `lambda-sign.sh` waits up to 30 minutes. Approve the SNS email while it waits. The job timeout is 40 minutes.
-4. GitHub Release `kmspgp-<shortsha>` is created with `kmspgp-<shortsha>.jar` and `kmspgp-<shortsha>.jar.asc`.
+2. The job builds the JAR, checks that the pin has exactly one primary key, then assumes the IAM role.
+3. `lambda-sign.sh --function …` waits up to 30 minutes. The sign step logs the OpenPGP digest and hashed creation time. Approve the SNS email while it waits; compare the digest in the email with that job log. The job timeout is 40 minutes.
+4. GitHub Release `kmspgp-<shortsha>` is created with `kmspgp-<shortsha>.jar` and `kmspgp-<shortsha>.jar.asc`. AWS credentials are unset before `gh release create`.
 
 Re-running the same commit fails if the tag already exists. That is intentional: a SHA maps to one Release. If sign succeeded and upload failed, delete the tag/release only when you intend to produce a new signature for the same bytes.
 
@@ -142,14 +142,14 @@ gh release download kmspgp-SHORTSHA --pattern 'kmspgp-*'
 
 ## Adapting this to another pipeline
 
-Keep kmslambda as-is. Copy [`github-actions/`](../github-actions/) and adjust:
+Keep kmslambda as-is. Copy [`github-actions/`](.) and adjust:
 
 1. Pin **your** OpenPGP public key in git (same export command, different path if you prefer).
 2. Point `job_workflow_ref` in `trust-policy.json` at **your** workflow file and branch.
 3. Use a GitHub Environment name and IAM role name that match that pipeline.
 4. Grant the role `lambda:InvokeFunction` on the same function (or another kmslambda you deploy).
-5. Put `AWS_ROLE_ARN` / region / function name / API URL in that Environment, not in the workflow file.
-6. Call `./dist/lambda-sign.sh` (or `java -jar kmspgp.jar lambda-sign ...`) on the artifact you actually ship. The JAR in this repo is both the tool and the dogfood artifact; other pipelines only need it as the signer client.
+5. Put `AWS_ROLE_ARN` / region / function name in that Environment, not in the workflow file.
+6. Call `./dist/lambda-sign.sh --function …` (or `java -jar kmspgp.jar lambda-sign --function …`) on the artifact you actually ship. The JAR in this repo is both the tool and the dogfood artifact; other pipelines only need it as the signer client.
 
 Do not reuse this role for unrelated workflows. A second pipeline should get its own role and `job_workflow_ref` so a compromised workflow file cannot mint signing credentials.
 
@@ -170,7 +170,9 @@ Deletes the IAM role and inline policy. Leaves the account-level GitHub OIDC pro
 | `Not authorized to perform sts:AssumeRoleWithWebIdentity` | Trust policy `sub` does not match the token. After 15 Jul 2026 GitHub includes owner/repo IDs (`repo:OWNER@ID/REPO@ID:environment:release`). Re-run `setup-oidc-role.sh`. CloudTrail `userIdentity.userName` is the actual `sub`. Also check `job_workflow_ref` (workflow path and `@refs/heads/main`) |
 | `lambda:InvokeFunction` denied | Permissions policy ARN does not match the function the workflow invokes; re-run `setup-oidc-role.sh` after sourcing `config.sh` |
 | Job hits 40 minutes | Nobody approved; kmslambda poll timeout is 30 minutes |
-| `Live OpenPGP fingerprint does not match` | KMS key was rotated and `keys/signing.pub.asc` was not updated |
+| Email digest does not match the Actions log | Approve only if they match. Recalculate with kmspgp from the artifact plus `hashedAt` (not `sha256sum`) |
+| GnuPG verify fails after a key rotation | `keys/signing.pub.asc` was not updated; re-export and commit the pin |
+| Pin check fails (`exactly one primary OpenPGP key`) | Extra keys in the pin; export a single primary key |
 | Release create fails with tag exists | That commit already has a Release; use a new commit or delete the tag only if you mean to re-sign |
 | `kmspgp.jar not found` | `./kmspgp/build.sh` did not run or Java/Maven is missing on the runner |
 

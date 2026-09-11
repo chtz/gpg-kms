@@ -68,7 +68,7 @@ add_approver() {
   echo
   echo "Next (after confirming the email):"
   echo "  ./config.sh > envfile && . ./envfile"
-  echo "  ../dist/lambda-sign.sh --function \"\$KMSPGP_LAMBDA_FUNCTION_NAME\" --api \"\$KMSPGP_LAMBDA_API_BASE_URL\" /path/to/artifact"
+  echo "  ../dist/lambda-sign.sh --function \"\$KMSPGP_LAMBDA_FUNCTION_NAME\" /path/to/artifact"
 }
 
 list_approvers() {

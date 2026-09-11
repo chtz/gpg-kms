@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Detached OpenPGP signature via kmslambda (human approval).
 # Jar must sit next to this script. Does not read Terraform.
-# Usage: lambda-sign.sh --function NAME --api URL <artifact> [output.asc]
+# Usage: lambda-sign.sh --function NAME <artifact> [output.asc]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,13 +9,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 usage() {
-  echo "Usage: $0 --function NAME --api URL [--version VER] [--environment ENV] <artifact> [output.asc]" >&2
-  echo "Env: KMSPGP_LAMBDA_FUNCTION_NAME, KMSPGP_LAMBDA_API_BASE_URL, KMSPGP_VERSION, KMSPGP_ENVIRONMENT" >&2
+  echo "Usage: $0 --function NAME [--version VER] [--environment ENV] <artifact> [output.asc]" >&2
+  echo "Env: KMSPGP_LAMBDA_FUNCTION_NAME, KMSPGP_VERSION, KMSPGP_ENVIRONMENT" >&2
   exit 1
 }
 
 FUNCTION="${KMSPGP_LAMBDA_FUNCTION_NAME:-}"
-API="${KMSPGP_LAMBDA_API_BASE_URL:-}"
 VERSION="${KMSPGP_VERSION:-}"
 ENVIRONMENT="${KMSPGP_ENVIRONMENT:-}"
 POSITIONAL=()
@@ -23,7 +22,6 @@ POSITIONAL=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --function) [[ $# -ge 2 ]] || usage; FUNCTION="$2"; shift 2 ;;
-    --api) [[ $# -ge 2 ]] || usage; API="$2"; shift 2 ;;
     --version) [[ $# -ge 2 ]] || usage; VERSION="$2"; shift 2 ;;
     --environment) [[ $# -ge 2 ]] || usage; ENVIRONMENT="$2"; shift 2 ;;
     -h|--help) usage ;;
@@ -33,7 +31,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 require_val --function KMSPGP_LAMBDA_FUNCTION_NAME "$FUNCTION"
-require_val --api KMSPGP_LAMBDA_API_BASE_URL "$API"
 [[ ${#POSITIONAL[@]} -ge 1 && ${#POSITIONAL[@]} -le 2 ]] || usage
 
 ARTIFACT="${POSITIONAL[0]}"
@@ -50,14 +47,14 @@ fi
 mkdir -p "$(dirname "$OUTPUT")"
 echo "Signing via kmslambda (approve the SNS link while this waits):"
 echo "  function:  $FUNCTION"
-echo "  api:       $API"
 echo "  artifact:  $ARTIFACT"
 echo "  signature: $OUTPUT"
 [[ -n "$VERSION" ]] && echo "  version:   $VERSION"
 [[ -n "$ENVIRONMENT" ]] && echo "  env:       $ENVIRONMENT"
+echo "The OpenPGP digest KMS will sign is printed next; compare it with the approval email."
 echo
 
-lambda_args=(lambda-sign --function "$FUNCTION" --api "$API" --artifact "$(basename "$ARTIFACT")")
+lambda_args=(lambda-sign --function "$FUNCTION" --artifact "$(basename "$ARTIFACT")")
 if [[ -n "$VERSION" ]]; then
   lambda_args+=(--version "$VERSION")
 fi

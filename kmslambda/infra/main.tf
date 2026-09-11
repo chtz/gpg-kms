@@ -14,6 +14,64 @@ locals {
   api_base_url = "${aws_apigatewayv2_api.http.api_endpoint}/${aws_apigatewayv2_stage.stage.name}"
 }
 
+# ---------- IAM Role (created before the key so the key policy can name it) ----------
+data "aws_iam_policy_document" "assume_lambda" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "lambda" {
+  name               = "${local.name_suffix}-lambda-role"
+  assume_role_policy = data.aws_iam_policy_document.assume_lambda.json
+}
+
+data "aws_iam_policy_document" "signing_key" {
+  statement {
+    sid = "EnableRoot"
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+    actions   = ["kms:*"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid = "AllowLambdaCrypto"
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_role.lambda.arn]
+    }
+    actions = [
+      "kms:Sign",
+      "kms:GetPublicKey",
+      "kms:DescribeKey",
+    ]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "DenySignExceptLambda"
+    effect = "Deny"
+    principals {
+      type        = "AWS"
+      identifiers = ["*"]
+    }
+    actions   = ["kms:Sign"]
+    resources = ["*"]
+    condition {
+      test     = "ArnNotEquals"
+      variable = "aws:PrincipalArn"
+      values   = [aws_iam_role.lambda.arn]
+    }
+  }
+}
+
 # ---------- KMS Signing Key ----------
 resource "aws_kms_key" "signing" {
   description              = "Artifact Signing Key (KMS) for ${var.project_name}"
@@ -22,6 +80,7 @@ resource "aws_kms_key" "signing" {
   deletion_window_in_days  = 7
   enable_key_rotation      = false
   multi_region             = false
+  policy                   = data.aws_iam_policy_document.signing_key.json
   tags = {
     Project = var.project_name
   }
@@ -71,6 +130,11 @@ resource "aws_apigatewayv2_stage" "stage" {
   api_id      = aws_apigatewayv2_api.http.id
   name        = var.api_stage_name
   auto_deploy = true
+
+  default_route_settings {
+    throttling_burst_limit = 20
+    throttling_rate_limit  = 10
+  }
 }
 
 # ---------- Lambda packaging ----------
@@ -79,22 +143,6 @@ data "archive_file" "lambda_zip" {
   type        = "zip"
   source_file = "${path.module}/../dist/index.js"
   output_path = "${path.module}/../dist/lambda.zip"
-}
-
-# ---------- IAM Role & Policies ----------
-data "aws_iam_policy_document" "assume_lambda" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["lambda.amazonaws.com"]
-    }
-  }
-}
-
-resource "aws_iam_role" "lambda" {
-  name               = "${local.name_suffix}-lambda-role"
-  assume_role_policy = data.aws_iam_policy_document.assume_lambda.json
 }
 
 data "aws_iam_policy_document" "lambda_policy" {
@@ -220,23 +268,27 @@ resource "aws_apigatewayv2_route" "get_request" {
   target    = "integrations/${aws_apigatewayv2_integration.lambda_proxy.id}"
 }
 
-resource "aws_apigatewayv2_route" "get_public_key" {
-  api_id    = aws_apigatewayv2_api.http.id
-  route_key = "GET /public-key"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda_proxy.id}"
-}
-
-resource "aws_apigatewayv2_route" "get_openpgp_public_key" {
-  api_id    = aws_apigatewayv2_api.http.id
-  route_key = "GET /openpgp-public-key"
-  target    = "integrations/${aws_apigatewayv2_integration.lambda_proxy.id}"
-}
-
-resource "aws_lambda_permission" "apigw_invoke" {
-  statement_id  = "AllowAPIGwInvoke"
+resource "aws_lambda_permission" "apigw_get_approve" {
+  statement_id  = "AllowApiGetApprove"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.main.function_name
   principal     = "apigateway.amazonaws.com"
-  source_arn    = "${aws_apigatewayv2_api.http.execution_arn}/*/*"
+  source_arn    = "${aws_apigatewayv2_api.http.execution_arn}/*/GET/approve"
+}
+
+resource "aws_lambda_permission" "apigw_post_approve" {
+  statement_id  = "AllowApiPostApprove"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.main.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http.execution_arn}/*/POST/approve"
+}
+
+resource "aws_lambda_permission" "apigw_get_request" {
+  statement_id  = "AllowApiGetRequest"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.main.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http.execution_arn}/*/GET/requests/*"
 }
 

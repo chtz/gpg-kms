@@ -27,7 +27,7 @@ Once, for export and sign (not for verify). Wrappers in `dist/` call `kmspgp.jar
 
 ## Signed releases
 
-This repo dogfoods the approval service: a manual GitHub Actions workflow builds `kmspgp-<shortsha>.jar`, signs it through kmslambda, and publishes the JAR plus detached signature as a [GitHub Release](https://github.com/chtz/gpg-kms/releases). The OpenPGP public key is pinned at [`keys/signing.pub.asc`](keys/signing.pub.asc). Setup (OIDC, IAM, GitHub Environment) is in [docs/github-actions.md](docs/github-actions.md).
+This repo dogfoods the approval service: a manual GitHub Actions workflow builds `kmspgp-<shortsha>.jar`, signs it through kmslambda, and publishes the JAR plus detached signature as a [GitHub Release](https://github.com/chtz/gpg-kms/releases). The OpenPGP public key is pinned at [`keys/signing.pub.asc`](keys/signing.pub.asc). Setup (OIDC, IAM, GitHub Environment) is in [github-actions/github-actions.md](github-actions/github-actions.md).
 
 ```bash
 gh release download kmspgp-SHORTSHA --pattern 'kmspgp-*'
@@ -91,15 +91,17 @@ echo "hello" > "$WORK/example-1.0.0.txt"
 
 Also needs Terraform ≥ 1.5, Node.js 22+, npm, `openssl`.
 
-Name and email are bound at deploy (kept in gitignored `kmslambda/infra/terraform.tfvars` so later deploys reuse them). The public export endpoint always returns that User ID.
+Name and email are bound at deploy (kept in gitignored `kmslambda/infra/terraform.tfvars` so later deploys reuse them). Export via Lambda invoke always returns that User ID.
+
+Both backends wrap the KMS signature the same way: OpenPGP packet from DER + fingerprint. Direct KMS derives the fingerprint from `GetPublicKey` plus the key creation date. kmslambda returns `signature` and `fingerprint` on a `SIGNED` poll. The pin file is for **verify**, not for sign.
 
 ### Admin: deploy, approvers, export
 
-The stack includes the KMS key, Lambda, and a public HTTP export endpoint. Publish `$WORK/signing.pub.asc` as the pinned root of trust; install scripts can also fetch the same key from the API later.
+The stack includes the KMS key and Lambda. Only the Lambda role may call `kms:Sign` on that key. HTTP is approve and poll only — no public-key routes. Publish `$WORK/signing.pub.asc` as the pinned root of trust.
 
 **Needs:** AWS credentials that can apply the Terraform stack (KMS, Lambda, API Gateway, DynamoDB, SNS, IAM, SSM, S3, CloudWatch). First deploy requires `--user-name` and `--user-email` (or `KMSPGP_USER_NAME` / `KMSPGP_USER_EMAIL`).  
-**Export permissions:** none. HTTPS GET of `/openpgp-public-key` (needs `$KMSPGP_LAMBDA_API_BASE_URL` from env).  
-**Produces:** `$WORK/env` for the signing pipeline (`KMSPGP_LAMBDA_FUNCTION_NAME`, `KMSPGP_LAMBDA_API_BASE_URL`, `AWS_REGION`), `$WORK/signing.pub.asc` for verifiers.
+**Export permissions:** `lambda:InvokeFunction` (not `kms:Sign`).  
+**Produces:** `$WORK/env` for the signing pipeline (`KMSPGP_LAMBDA_FUNCTION_NAME`, `AWS_REGION`; `KMSPGP_LAMBDA_API_BASE_URL` is informational), `$WORK/signing.pub.asc` for verifiers.
 
 ```bash
 WORK=$(mktemp -d)
@@ -112,7 +114,7 @@ WORK=$(mktemp -d)
 ./kmslambda/config.sh > "$WORK/env"
 . "$WORK/env"
 
-./dist/lambda-export.sh --api "$KMSPGP_LAMBDA_API_BASE_URL" \
+./dist/lambda-export.sh --function "$KMSPGP_LAMBDA_FUNCTION_NAME" \
   --out "$WORK/signing.pub.asc"
 ```
 
@@ -121,13 +123,14 @@ WORK=$(mktemp -d)
 **Needs:** `$WORK/env`, the artifact, `dist/kmspgp.jar`. A confirmed approver must click the email link while sign waits.  
 **Permissions:** `lambda:InvokeFunction` only. Not the admin Terraform IAM, not `kms:Sign`.
 
+`lambda-sign` prints the OpenPGP SHA-256 digest KMS will sign (not `sha256sum` of the file) plus the hashed creation time. Compare that with the approval email.
+
 ```bash
 . "$WORK/env"
 echo "hello" > "$WORK/example-1.0.0.txt"
 
 ./dist/lambda-sign.sh \
   --function "$KMSPGP_LAMBDA_FUNCTION_NAME" \
-  --api "$KMSPGP_LAMBDA_API_BASE_URL" \
   --version 1.0.0 \
   "$WORK/example-1.0.0.txt" "$WORK/example-1.0.0.txt.asc"
 ```

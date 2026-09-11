@@ -14,7 +14,7 @@ BRANCH="main"
 usage() {
   echo "Usage: $0 [--repo OWNER/REPO] [--role-name NAME]" >&2
   echo "Env: GITHUB_REPOSITORY, AWS_ROLE_ARN, AWS_ROLE_NAME, AWS_REGION," >&2
-  echo "     KMSPGP_LAMBDA_FUNCTION_NAME, KMSPGP_LAMBDA_API_BASE_URL" >&2
+  echo "     KMSPGP_LAMBDA_FUNCTION_NAME" >&2
   echo "Source kmslambda/config.sh and github-actions/.local/role.env first." >&2
   exit 1
 }
@@ -45,7 +45,6 @@ resolve_github_repo
 
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
 FUNCTION="${KMSPGP_LAMBDA_FUNCTION_NAME:-}"
-API="${KMSPGP_LAMBDA_API_BASE_URL:-}"
 
 if [[ -z "$ROLE_ARN" ]]; then
   echo "AWS_ROLE_ARN is not set. Run setup-oidc-role.sh first and source github-actions/.local/role.env." >&2
@@ -57,10 +56,6 @@ if [[ -z "$REGION" ]]; then
 fi
 if [[ -z "$FUNCTION" ]]; then
   echo "KMSPGP_LAMBDA_FUNCTION_NAME is not set. Source kmslambda/config.sh." >&2
-  exit 1
-fi
-if [[ -z "$API" ]]; then
-  echo "KMSPGP_LAMBDA_API_BASE_URL is not set. Source kmslambda/config.sh." >&2
   exit 1
 fi
 
@@ -98,8 +93,9 @@ gh variable set AWS_REGION --repo "$GITHUB_REPO" --env "$ENV_NAME" --body "$REGI
 echo "Set environment variable AWS_REGION." >&2
 gh variable set KMSPGP_LAMBDA_FUNCTION_NAME --repo "$GITHUB_REPO" --env "$ENV_NAME" --body "$FUNCTION"
 echo "Set environment variable KMSPGP_LAMBDA_FUNCTION_NAME." >&2
-gh variable set KMSPGP_LAMBDA_API_BASE_URL --repo "$GITHUB_REPO" --env "$ENV_NAME" --body "$API"
-echo "Set environment variable KMSPGP_LAMBDA_API_BASE_URL." >&2
+if gh variable delete KMSPGP_LAMBDA_API_BASE_URL --repo "$GITHUB_REPO" --env "$ENV_NAME" >/dev/null 2>&1; then
+  echo "Removed leftover environment variable KMSPGP_LAMBDA_API_BASE_URL." >&2
+fi
 
 echo >&2
 echo "GitHub Environment '$ENV_NAME' is ready. Trigger .github/workflows/release-jar.yml on $BRANCH." >&2

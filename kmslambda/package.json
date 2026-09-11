@@ -2,7 +2,7 @@
   "name": "artifact-signing-service",
   "version": "0.1.0",
   "private": true,
-  "description": "Serverless KMS-backed artifact signing service (approval via SNS, HTTP API for approval/status/public-key).",
+  "description": "Serverless KMS-backed OpenPGP signing service (SNS approval, HTTP API for approve/poll).",
   "license": "MIT",
   "type": "commonjs",
   "scripts": {

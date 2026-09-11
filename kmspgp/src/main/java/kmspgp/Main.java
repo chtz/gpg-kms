@@ -10,13 +10,12 @@ import software.amazon.awssdk.services.kms.model.KeySpec;
 
 import java.security.MessageDigest;
 import java.time.Instant;
-import java.util.HexFormat;
 
 public final class Main {
     private static final String USAGE =
             "usage: export --user-name NAME --user-email EMAIL KEY | -bsau KEY"
-                    + " | lambda-export --api URL"
-                    + " | lambda-sign --function NAME --api URL"
+                    + " | lambda-export --function NAME"
+                    + " | lambda-sign --function NAME"
                     + " [--artifact NAME] [--version VER] [--environment ENV]";
     private static final int LAMBDA_POLL_INTERVAL_SECONDS = 2;
     private static final int LAMBDA_POLL_TIMEOUT_SECONDS = 1800;
@@ -54,39 +53,33 @@ public final class Main {
     private static void sign(String keyId) throws Exception {
         try (var kms = kms()) {
             var key = load(kms, keyId);
+            var hashedAt = Instant.now();
             var digest = MessageDigest.getInstance("SHA-256");
             System.in.transferTo(new Pgp.DigestStream(digest));
-            var pub = Pgp.publicKey(key.des.keyMetadata().creationDate(), key.pub.publicKey().asByteArray());
+            var fingerprint = Pgp.fingerprint(
+                    key.des.keyMetadata().creationDate(),
+                    key.pub.publicKey().asByteArray());
             System.out.println(Pgp.sign(
-                    Instant.now(),
+                    hashedAt,
                     digest,
-                    pub,
-                    Pgp.kmsSigner(kms, key.des.keyMetadata().keyId())));
+                    Pgp.kmsDocumentSigner(kms, key.des.keyMetadata().keyId(), fingerprint)));
         }
     }
 
     private static void lambdaExport(LambdaExportArgs opts) throws Exception {
-        System.out.println(LambdaSigning.fetchOpenPgpPublicKey(opts.api));
+        System.out.println(LambdaSigning.exportPublicKey(opts.functionName));
     }
 
     private static void lambdaSign(LambdaSignArgs opts) throws Exception {
-        var remote = LambdaSigning.fetchPublicKey(opts.api);
-        if (remote.keySpec() != null && !"ECC_NIST_P256".equals(remote.keySpec())) {
-            throw new IllegalArgumentException("Only ECC_NIST_P256 is supported, got " + remote.keySpec());
-        }
-        var pub = Pgp.publicKey(remote.createdAt(), remote.spki());
-
-        var fileSha = MessageDigest.getInstance("SHA-256");
-        var openPgp = MessageDigest.getInstance("SHA-256");
-        System.in.transferTo(new Pgp.TeeStream(new Pgp.DigestStream(fileSha), new Pgp.DigestStream(openPgp)));
-        var fileSha256 = HexFormat.of().formatHex(fileSha.digest());
-
+        var hashedAt = Instant.now();
+        var digest = MessageDigest.getInstance("SHA-256");
+        System.in.transferTo(new Pgp.DigestStream(digest));
         var artifact = opts.artifact != null ? opts.artifact : "stdin";
-        System.out.println(Pgp.sign(Instant.now(), openPgp, pub, digest ->
+        System.out.println(Pgp.sign(hashedAt, digest, d ->
                 LambdaSigning.signDigest(
                         opts.functionName,
-                        digest,
-                        fileSha256,
+                        d,
+                        hashedAt,
                         artifact,
                         opts.version,
                         opts.environment,
@@ -134,41 +127,39 @@ public final class Main {
     }
 
     private static LambdaExportArgs parseLambdaExport(String[] args) {
-        String api = null;
+        String functionName = null;
         for (int i = 1; i < args.length; i++) {
             switch (args[i]) {
-                case "--api" -> api = requireValue(args, ++i, "--api");
-                default -> fail("usage: lambda-export --api URL");
+                case "--function" -> functionName = requireValue(args, ++i, "--function");
+                default -> fail("usage: lambda-export --function NAME");
             }
         }
-        if (api == null) {
-            fail("usage: lambda-export --api URL");
+        if (functionName == null) {
+            fail("usage: lambda-export --function NAME");
         }
-        return new LambdaExportArgs(api);
+        return new LambdaExportArgs(functionName);
     }
 
     private static LambdaSignArgs parseLambdaSign(String[] args) {
         String functionName = null;
-        String api = null;
         String artifact = null;
         String version = null;
         String environment = null;
         for (int i = 1; i < args.length; i++) {
             switch (args[i]) {
                 case "--function" -> functionName = requireValue(args, ++i, "--function");
-                case "--api" -> api = requireValue(args, ++i, "--api");
                 case "--artifact" -> artifact = requireValue(args, ++i, "--artifact");
                 case "--version" -> version = requireValue(args, ++i, "--version");
                 case "--environment" -> environment = requireValue(args, ++i, "--environment");
-                default -> fail("usage: lambda-sign --function NAME --api URL"
+                default -> fail("usage: lambda-sign --function NAME"
                         + " [--artifact NAME] [--version VER] [--environment ENV]");
             }
         }
-        if (functionName == null || api == null) {
-            fail("usage: lambda-sign --function NAME --api URL"
+        if (functionName == null) {
+            fail("usage: lambda-sign --function NAME"
                     + " [--artifact NAME] [--version VER] [--environment ENV]");
         }
-        return new LambdaSignArgs(functionName, api, artifact, version, environment);
+        return new LambdaSignArgs(functionName, artifact, version, environment);
     }
 
     private static String userId(String userName, String userEmail, String description) {
@@ -194,11 +185,10 @@ public final class Main {
 
     private record ExportArgs(String userName, String userEmail, String keyId) {}
 
-    private record LambdaExportArgs(String api) {}
+    private record LambdaExportArgs(String functionName) {}
 
     private record LambdaSignArgs(
             String functionName,
-            String api,
             String artifact,
             String version,
             String environment
