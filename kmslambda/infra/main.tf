@@ -224,6 +224,12 @@ resource "aws_apigatewayv2_route" "get_public_key" {
   target    = "integrations/${aws_apigatewayv2_integration.lambda_proxy.id}"
 }
 
+resource "aws_apigatewayv2_route" "get_openpgp_public_key" {
+  api_id    = aws_apigatewayv2_api.http.id
+  route_key = "GET /openpgp-public-key"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda_proxy.id}"
+}
+
 resource "aws_lambda_permission" "apigw_invoke" {
   statement_id  = "AllowAPIGwInvoke"
   action        = "lambda:InvokeFunction"

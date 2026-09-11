@@ -6,11 +6,12 @@ import {
   PutCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
-import { KMSClient, GetPublicKeyCommand, SignCommand } from '@aws-sdk/client-kms';
+import { KMSClient, DescribeKeyCommand, GetPublicKeyCommand, SignCommand } from '@aws-sdk/client-kms';
 import { SNSClient, PublishCommand } from '@aws-sdk/client-sns';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { ulid } from 'ulid';
 import crypto from 'crypto';
+import { exportCertifiedPublicKey, OpenPgpPublicKey } from './openpgp';
 
 // ---------- Environment ----------
 const {
@@ -55,7 +56,8 @@ type Status = 'WAITING' | 'SIGNING' | 'SIGNED' | 'FAILED' | 'REJECTED';
 interface SignRequestItem {
   requestId: string;
   status: Status;
-  artifactDigest: string; // sha256 hex
+  artifactDigest: string; // digest KMS signs (sha256 hex)
+  fileSha256?: string; // optional display-only file hash
   artifact?: string;
   version?: string;
   environment?: string;
@@ -203,7 +205,7 @@ async function createRequest(input: any) {
   if (!TABLE_NAME || !KMS_KEY_ID || !SNS_TOPIC_ARN || !API_BASE_URL) {
     throw new Error('Service not configured (env vars missing)');
   }
-  const { digest, artifact, version, environment, metadata } = input || {};
+  const { digest, fileSha256, artifact, version, environment, metadata } = input || {};
   if (!digest || typeof digest !== 'string' || !isHexSha256(digest)) {
     return {
       ok: false,
@@ -211,15 +213,27 @@ async function createRequest(input: any) {
       code: 'BAD_DIGEST',
     };
   }
+  if (fileSha256 != null && fileSha256 !== '') {
+    if (typeof fileSha256 !== 'string' || !isHexSha256(fileSha256)) {
+      return {
+        ok: false,
+        error: 'Invalid fileSha256: expected 64-char hex SHA-256',
+        code: 'BAD_FILE_SHA256',
+      };
+    }
+  }
   const requestId = ulid();
   const createdAt = nowSeconds();
   const expiresAt = createdAt + REQUEST_TTL_SECONDS;
   const approvalExpiresAt = createdAt + APPROVAL_TTL_SECONDS;
+  const fileHash =
+    typeof fileSha256 === 'string' && fileSha256 !== '' ? fileSha256.toLowerCase() : undefined;
 
   const item: SignRequestItem = {
     requestId,
     status: 'WAITING',
     artifactDigest: digest.toLowerCase(),
+    fileSha256: fileHash,
     artifact,
     version,
     environment,
@@ -255,13 +269,16 @@ async function createRequest(input: any) {
   )}`;
 
   // Publish approval notification via SNS (do not log token/URL)
+  const digestLines = fileHash
+    ? [`File SHA-256: ${fileHash}`, `Signing digest: ${digest.toLowerCase()}`]
+    : [`SHA-256: ${digest.toLowerCase()}`];
   const messageLines = [
     `Artifact signing approval requested`,
     artifact ? `Artifact: ${artifact}` : undefined,
     version ? `Version: ${version}` : undefined,
     environment ? `Environment: ${environment}` : undefined,
     `Request ID: ${requestId}`,
-    `SHA-256: ${digest.toLowerCase()}`,
+    ...digestLines,
     `Approval link (expires ${new Date(approvalExpiresAt * 1000).toISOString()}):`,
     `${approvalUrl}`,
   ].filter(Boolean) as string[];
@@ -318,13 +335,13 @@ function renderApprovalPage(opts: {
   const body = ok && item
     ? `
     <h1>${title}</h1>
-    <p>Please review the artifact details below. Clicking Approve authorizes a KMS signature for this exact SHA-256 digest. GET does not approve.</p>
+    <p>Please review the artifact details below. Clicking Approve authorizes a KMS signature for this ${item.fileSha256 ? 'signing digest' : 'exact SHA-256 digest'}. GET does not approve.</p>
     <ul>
       <li><strong>Request ID:</strong> ${escapeHtml(item.requestId)}</li>
       ${item.artifact ? `<li><strong>Artifact:</strong> ${escapeHtml(item.artifact)}</li>` : ''}
       ${item.version ? `<li><strong>Version:</strong> ${escapeHtml(item.version)}</li>` : ''}
       ${item.environment ? `<li><strong>Environment:</strong> ${escapeHtml(item.environment)}</li>` : ''}
-      <li><strong>SHA-256:</strong> <code>${escapeHtml(item.artifactDigest)}</code></li>
+      ${digestListItems(item)}
       <li><strong>Status:</strong> ${escapeHtml(item.status)}</li>
       <li><strong>Created:</strong> ${new Date(item.createdAt * 1000).toISOString()}</li>
       <li><strong>Expires:</strong> ${new Date(item.expiresAt * 1000).toISOString()}</li>
@@ -365,6 +382,14 @@ function renderApprovalPage(opts: {
       ${body}
     </body>
   </html>`;
+}
+
+function digestListItems(item: SignRequestItem): string {
+  if (item.fileSha256) {
+    return `<li><strong>File SHA-256:</strong> <code>${escapeHtml(item.fileSha256)}</code></li>
+      <li><strong>Signing digest:</strong> <code>${escapeHtml(item.artifactDigest)}</code></li>`;
+  }
+  return `<li><strong>SHA-256:</strong> <code>${escapeHtml(item.artifactDigest)}</code></li>`;
 }
 
 function parseFormUrlEncoded(body: string): Record<string, string> {
@@ -632,6 +657,9 @@ async function handleGetRequestStatus(event: any) {
       createdAt: item.createdAt,
       expiresAt: item.expiresAt,
     };
+    if (item.fileSha256) {
+      response.fileSha256 = item.fileSha256;
+    }
     if (item.status === 'SIGNED' && item.signature) {
       response.signature = item.signature;
       response.signingAlgorithm = item.algorithm || 'ECDSA_SHA_256';
@@ -650,46 +678,105 @@ async function handleGetRequestStatus(event: any) {
   }
 }
 
-let cachedPublicKeyPem: string | null = null;
-let cachedKeyMeta: { keySpec?: string; signingAlgorithms?: string[]; keyUsage?: string } | null = null;
+interface PublicKeyInfo {
+  pem: string;
+  keySpec?: string;
+  signingAlgorithms?: string[];
+  keyUsage?: string;
+  creationDate: Date;
+  description?: string;
+  arn?: string;
+}
+
+let cachedPublicKey: PublicKeyInfo | null = null;
+
+async function loadPublicKey(): Promise<PublicKeyInfo> {
+  if (cachedPublicKey) return cachedPublicKey;
+  if (!KMS_KEY_ID) throw new Error('KMS_KEY_ID not set');
+  const [pub, des] = await Promise.all([
+    kms.send(new GetPublicKeyCommand({ KeyId: KMS_KEY_ID })),
+    kms.send(new DescribeKeyCommand({ KeyId: KMS_KEY_ID })),
+  ]);
+  const publicKeyDer = pub.PublicKey;
+  if (!publicKeyDer) throw new Error('No public key');
+  const created = des.KeyMetadata?.CreationDate;
+  if (!created) throw new Error('KMS key has no creation date');
+  const b64 = Buffer.from(publicKeyDer).toString('base64');
+  cachedPublicKey = {
+    pem: `-----BEGIN PUBLIC KEY-----\n${chunk64(b64)}\n-----END PUBLIC KEY-----\n`,
+    keySpec: pub.KeySpec,
+    signingAlgorithms: pub.SigningAlgorithms as string[] | undefined,
+    keyUsage: pub.KeyUsage,
+    creationDate: created,
+    description: des.KeyMetadata?.Description,
+    arn: des.KeyMetadata?.Arn,
+  };
+  return cachedPublicKey;
+}
+
+function publicKeyJson(info: PublicKeyInfo) {
+  return {
+    ok: true,
+    keyId: KMS_KEY_ID,
+    publicKeyPem: info.pem,
+    keySpec: info.keySpec,
+    signingAlgorithms: info.signingAlgorithms,
+    keyUsage: info.keyUsage,
+    creationDate: info.creationDate.toISOString(),
+    description: info.description,
+    arn: info.arn,
+  };
+}
 
 async function handleGetPublicKey() {
   try {
-    if (cachedPublicKeyPem && cachedKeyMeta) {
-      return jsonResponse(200, {
-        ok: true,
-        keyId: KMS_KEY_ID,
-        publicKeyPem: cachedPublicKeyPem,
-        keySpec: cachedKeyMeta.keySpec,
-        signingAlgorithms: cachedKeyMeta.signingAlgorithms,
-        keyUsage: cachedKeyMeta.keyUsage,
-      });
-    }
-    const out = await kms.send(
-      new GetPublicKeyCommand({
-        KeyId: KMS_KEY_ID!,
-      })
-    );
-    const publicKeyDer = out.PublicKey;
-    if (!publicKeyDer) throw new Error('No public key');
-    const b64 = Buffer.from(publicKeyDer).toString('base64');
-    const pem = `-----BEGIN PUBLIC KEY-----\n${chunk64(b64)}\n-----END PUBLIC KEY-----\n`;
-    cachedPublicKeyPem = pem;
-    cachedKeyMeta = {
-      keySpec: out.KeySpec,
-      signingAlgorithms: out.SigningAlgorithms as string[] | undefined,
-      keyUsage: out.KeyUsage,
-    };
-    return jsonResponse(200, {
-      ok: true,
-      keyId: KMS_KEY_ID,
-      publicKeyPem: pem,
-      keySpec: out.KeySpec,
-      signingAlgorithms: out.SigningAlgorithms,
-      keyUsage: out.KeyUsage,
-    });
+    const info = await loadPublicKey();
+    return jsonResponse(200, publicKeyJson(info));
   } catch (err: any) {
     console.error(JSON.stringify({ level: 'error', msg: 'public-key failed', error: err?.message }));
+    return jsonResponse(500, { ok: false, error: 'Internal error' });
+  }
+}
+
+const openPgpCache = new Map<string, OpenPgpPublicKey>();
+
+async function handleGetOpenPgpPublicKey(event: any) {
+  try {
+    const userName = (event.queryStringParameters?.userName || '').trim();
+    const userEmail = (event.queryStringParameters?.userEmail || '').trim();
+    if (!userName || !userEmail) {
+      return jsonResponse(400, { ok: false, error: 'Missing userName or userEmail' });
+    }
+    const info = await loadPublicKey();
+    let userId = `${userName} <${userEmail}>`;
+    if (info.description && info.description.trim()) {
+      userId += ` (${info.description.trim()})`;
+    }
+    const cached = openPgpCache.get(userId);
+    if (cached) {
+      return jsonResponse(200, { ok: true, ...cached });
+    }
+    const exported = await exportCertifiedPublicKey({
+      publicKeyPem: info.pem,
+      createdAt: info.creationDate,
+      userId,
+      signDigest: async (digest) => {
+        const signOut = await kms.send(
+          new SignCommand({
+            KeyId: KMS_KEY_ID!,
+            Message: digest,
+            MessageType: 'DIGEST',
+            SigningAlgorithm: 'ECDSA_SHA_256',
+          })
+        );
+        if (!signOut.Signature) throw new Error('KMS returned no signature');
+        return Buffer.from(signOut.Signature);
+      },
+    });
+    openPgpCache.set(userId, exported);
+    return jsonResponse(200, { ok: true, ...exported });
+  } catch (err: any) {
+    console.error(JSON.stringify({ level: 'error', msg: 'openpgp-public-key failed', error: err?.message }));
     return jsonResponse(500, { ok: false, error: 'Internal error' });
   }
 }
@@ -726,6 +813,12 @@ async function handleHttp(event: any): Promise<APIGatewayProxyStructuredResultV2
   }
   if (routeKey === 'GET /public-key' || (method === 'GET' && path === '/public-key')) {
     return handleGetPublicKey();
+  }
+  if (
+    routeKey === 'GET /openpgp-public-key' ||
+    (method === 'GET' && path === '/openpgp-public-key')
+  ) {
+    return handleGetOpenPgpPublicKey(event);
   }
   return jsonResponse(404, { ok: false, error: 'Not found' });
 }

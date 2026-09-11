@@ -18,8 +18,6 @@ import org.bouncycastle.openpgp.operator.PGPContentSignerBuilder;
 import org.bouncycastle.openpgp.operator.bc.BcKeyFingerprintCalculator;
 import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.services.kms.KmsClient;
-import software.amazon.awssdk.services.kms.model.DescribeKeyResponse;
-import software.amazon.awssdk.services.kms.model.GetPublicKeyResponse;
 import software.amazon.awssdk.services.kms.model.MessageType;
 import software.amazon.awssdk.services.kms.model.SignRequest;
 import software.amazon.awssdk.services.kms.model.SigningAlgorithmSpec;
@@ -40,15 +38,29 @@ import java.util.Date;
 final class Pgp {
     private Pgp() {}
 
-    static String export(String user, DescribeKeyResponse des, GetPublicKeyResponse pubRes, KmsClient kms)
+    @FunctionalInterface
+    interface DigestSigner {
+        byte[] sign(byte[] digest) throws Exception;
+    }
+
+    static DigestSigner kmsSigner(KmsClient kms, String keyId) {
+        return digest -> kms.sign(SignRequest.builder()
+                .keyId(keyId)
+                .message(SdkBytes.fromByteArray(digest))
+                .messageType(MessageType.DIGEST)
+                .signingAlgorithm(SigningAlgorithmSpec.ECDSA_SHA_256)
+                .build()).signature().asByteArray();
+    }
+
+    static String export(String user, Instant keyCreated, byte[] spki, DigestSigner signer)
             throws Exception {
-        var pub = publicKey(des, pubRes);
+        var pub = publicKey(keyCreated, spki);
         var hashed = new PGPSignatureSubpacketGenerator();
-        hashed.setSignatureCreationTime(false, Date.from(des.keyMetadata().creationDate()));
+        hashed.setSignatureCreationTime(false, Date.from(keyCreated));
         hashed.addSignerUserID(false, user.getBytes(StandardCharsets.UTF_8));
         hashed.setIssuerFingerprint(false, pub);
         hashed.setKeyFlags(false, 0x03);
-        var signature = signPgp(0x10, pub, MessageDigest.getInstance("SHA-256"), hashed, kms, des, gen ->
+        var signature = signPgp(0x10, pub, MessageDigest.getInstance("SHA-256"), hashed, signer, gen ->
                 gen.generateCertification(user, pub));
         return armor(out -> {
             pub.encode(out);
@@ -57,30 +69,24 @@ final class Pgp {
         });
     }
 
-    static String sign(
-            Instant now,
-            MessageDigest digest,
-            DescribeKeyResponse des,
-            GetPublicKeyResponse pubRes,
-            KmsClient kms
-    ) throws Exception {
-        var pub = publicKey(des, pubRes);
+    static String sign(Instant now, MessageDigest digest, PGPPublicKey pub, DigestSigner signer)
+            throws Exception {
         var hashed = new PGPSignatureSubpacketGenerator();
         hashed.setSignatureCreationTime(false, Date.from(now));
-        var signature = signPgp(0x00, pub, digest, hashed, kms, des, PGPSignatureGenerator::generate);
+        var signature = signPgp(0x00, pub, digest, hashed, signer, PGPSignatureGenerator::generate);
         return armor(out -> signature.encode(out));
     }
 
-    private static PGPPublicKey publicKey(DescribeKeyResponse des, GetPublicKeyResponse pubRes) throws Exception {
+    static PGPPublicKey publicKey(Instant createdAt, byte[] spkiDer) throws Exception {
         var ec = (ECPublicKey) KeyFactory.getInstance("EC")
-                .generatePublic(new X509EncodedKeySpec(pubRes.publicKey().asByteArray()));
+                .generatePublic(new X509EncodedKeySpec(spkiDer));
         var point = uncompressedPoint(ec);
         var bcpgKey = new ECDSAPublicBCPGKey(SECObjectIdentifiers.secp256r1, new BigInteger(1, point));
         return new PGPPublicKey(
                 new PublicKeyPacket(
                         PublicKeyPacket.VERSION_4,
                         PublicKeyAlgorithmTags.ECDSA,
-                        Date.from(des.keyMetadata().creationDate()),
+                        Date.from(createdAt),
                         bcpgKey),
                 new BcKeyFingerprintCalculator());
     }
@@ -106,11 +112,10 @@ final class Pgp {
             PGPPublicKey pub,
             MessageDigest digest,
             PGPSignatureSubpacketGenerator hashed,
-            KmsClient kms,
-            DescribeKeyResponse des,
+            DigestSigner signer,
             SignatureFn generate
     ) throws Exception {
-        PGPContentSignerBuilder signer = (keyAlgorithm, hashAlgorithm) -> new PGPContentSigner() {
+        PGPContentSignerBuilder contentSigner = (keyAlgorithm, hashAlgorithm) -> new PGPContentSigner() {
             private final OutputStream digestStream = new DigestStream(digest);
             private byte[] digestValue;
             private byte[] signatureValue;
@@ -123,12 +128,13 @@ final class Pgp {
             @Override
             public byte[] getSignature() {
                 if (signatureValue == null) {
-                    signatureValue = kms.sign(SignRequest.builder()
-                            .keyId(des.keyMetadata().keyId())
-                            .message(SdkBytes.fromByteArray(getDigest()))
-                            .messageType(MessageType.DIGEST)
-                            .signingAlgorithm(SigningAlgorithmSpec.ECDSA_SHA_256)
-                            .build()).signature().asByteArray();
+                    try {
+                        signatureValue = signer.sign(getDigest());
+                    } catch (RuntimeException e) {
+                        throw e;
+                    } catch (Exception e) {
+                        throw new IllegalStateException(e);
+                    }
                 }
                 return signatureValue;
             }
@@ -162,7 +168,7 @@ final class Pgp {
             }
         };
 
-        var generator = new PGPSignatureGenerator(signer, pub);
+        var generator = new PGPSignatureGenerator(contentSigner, pub);
         generator.setHashedSubpackets(hashed.generate());
         generator.init(signatureType, new PGPPrivateKey(pub.getKeyID(), pub.getPublicKeyPacket(), null));
         return generate.apply(generator);
@@ -194,6 +200,28 @@ final class Pgp {
         @Override
         public void write(byte[] b, int off, int len) {
             digest.update(b, off, len);
+        }
+    }
+
+    static final class TeeStream extends OutputStream {
+        private final OutputStream a;
+        private final OutputStream b;
+
+        TeeStream(OutputStream a, OutputStream b) {
+            this.a = a;
+            this.b = b;
+        }
+
+        @Override
+        public void write(int value) throws IOException {
+            a.write(value);
+            b.write(value);
+        }
+
+        @Override
+        public void write(byte[] buf, int off, int len) throws IOException {
+            a.write(buf, off, len);
+            b.write(buf, off, len);
         }
     }
 

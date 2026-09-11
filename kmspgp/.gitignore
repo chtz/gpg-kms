@@ -1,5 +1,6 @@
 # Isolated GnuPG home used by the test-key scripts
 gpg_temp/
+gpg_temp_lambda/
 
 # Generated signatures and public-key exports
 *.asc

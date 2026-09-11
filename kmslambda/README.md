@@ -6,7 +6,7 @@ Minimal, KISS, pay-per-use artifact-signing service for release pipelines. Pipel
 - KMS SIGN_VERIFY key (ECC_NIST_P256), MessageType=DIGEST
 - DynamoDB for short-lived signing-request state (PAY_PER_REQUEST + TTL)
 - SNS for human approvals (subscriptions manage recipients)
-- API Gateway v2 HTTP API for approval/status/public-key
+- API Gateway v2 HTTP API for approval/status/public-key/OpenPGP public key
 - SSM Parameter Store SecureString for HMAC secret (script 01; not created by Terraform)
 - S3 bucket for Terraform state (script 02; not managed by Terraform)
 - Terraform provisions the rest (KMS, DynamoDB, SNS, API Gateway, Lambda, IAM)
@@ -38,7 +38,8 @@ Lifecycle: `WAITING → SIGNING → SIGNED | FAILED` and `WAITING → REJECTED`.
 - `GET /approve` — Render approval page (no side effects)
 - `POST /approve` — Approve or reject (explicit action)
 - `GET /requests/{id}` — Secure status/poll/signature retrieval (token)
-- `GET /public-key` — Return KMS public key (PEM/SPKI) + metadata
+- `GET /public-key` — Return KMS public key (PEM/SPKI) + metadata (`creationDate`, `description`, `arn`)
+- `GET /openpgp-public-key` — Return a self-certified OpenPGP public key (`userName` and `userEmail` query params). Lambda calls `kms:Sign` for the UID certification only; this is not the artifact-approval path.
 
 Separate signed tokens for approval and polling to avoid privilege escalation.
 
@@ -68,7 +69,7 @@ cd kmslambda
 Terraform follows the CLI session (temporary keys are exported for the AWS SDK). The HTTP API stage is `prod`; approval and poll URLs include `/prod`.
 
 Terraform outputs (printed by `06`):
-- `api_base_url` — Base URL for approval page, polling, and public key
+- `api_base_url` — Base URL for approval page, polling, public key, and OpenPGP public key
 - `lambda_function_name` — Function to invoke from pipeline
 - `dynamodb_table_name`, `sns_topic_arn`, `kms_key_id` — Resource references
 
@@ -94,7 +95,8 @@ Lambda environment is populated by Terraform:
 {
   "requestId": "01J...ULID",
   "status": "WAITING" | "SIGNING" | "SIGNED" | "FAILED" | "REJECTED",
-  "artifactDigest": "<sha256-hex>",
+  "artifactDigest": "<sha256-hex, the digest KMS signs>",
+  "fileSha256": "<optional sha256-hex of file bytes, display only>",
   "artifact": "...", "version": "...", "environment": "...",
   "metadata": { "..." : "..." },
   "createdAt": 1710000000,
@@ -118,7 +120,8 @@ Request:
 ```json
 {
   "action": "create",
-  "digest": "<sha256-hex>",
+  "digest": "<sha256-hex, signed by KMS>",
+  "fileSha256": "<optional 64-char hex of the artifact file>",
   "artifact": "myapp-linux-x64.tar.gz",
   "version": "2.3.1",
   "environment": "prod",
@@ -145,6 +148,13 @@ Errors:
 { "ok": false, "error": "Invalid or missing digest: expected 64-char hex SHA-256", "code": "BAD_DIGEST" }
 ```
 
+`fileSha256` is optional. `08_create_signing_request.sh` omits it; the approval page and SNS message then show a single `SHA-256` line (the digest KMS will sign), same as before. When `fileSha256` is set (kmspgp `lambda-sign` does this), SNS and the approval page show **File SHA-256** and **Signing digest** separately. `artifactDigest` in DynamoDB/poll is always the digest KMS signs.
+
+Errors for a bad `fileSha256`:
+```json
+{ "ok": false, "error": "Invalid fileSha256: expected 64-char hex SHA-256", "code": "BAD_FILE_SHA256" }
+```
+
 ## Polling for status/signature
 
 `GET {api_base_url}/requests/{requestId}?token=<pollToken>` or `Authorization: Bearer <pollToken>`
@@ -167,12 +177,12 @@ Responses:
 { "ok": true, "requestId": "...", "status": "REJECTED", "rejectionReason": "Rejected" }
 ```
 
-401/403 when token is missing/invalid/not for this request; 404 if request not found.
+401/403 when token is missing/invalid/not for this request; 404 if request not found. Poll JSON includes `fileSha256` when the create request supplied it.
 
 ## Approval via SNS
 
 - Subscribe approvers (email, SMS, etc.) to the SNS topic Terraform creates.
-- The published message includes artifact metadata, digest, and the approval link.
+- The published message includes artifact metadata, digest (and file SHA-256 when `fileSha256` was sent), and the approval link.
 - `GET /approve` renders an HTML page with details and Approve/Reject buttons.
 - `GET` never approves; only `POST` changes state.
 - Approval is one-time via DynamoDB conditional update; double-clicks are safe.
@@ -188,13 +198,28 @@ Responses:
   "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMIIB...==\n-----END PUBLIC KEY-----\n",
   "keySpec": "ECC_NIST_P256",
   "signingAlgorithms": ["ECDSA_SHA_256"],
-  "keyUsage": "SIGN_VERIFY"
+  "keyUsage": "SIGN_VERIFY",
+  "creationDate": "2026-01-15T12:34:56.000Z",
+  "description": "Artifact Signing Key (KMS) for artifact-signing-service",
+  "arn": "arn:aws:kms:..."
 }
 ```
 
-Verification is KMS ECDSA over SHA-256 of the artifact bytes. The signature is ASN.1 DER ECDSA (r,s). This is not OpenPGP; `gpg --verify` will not work.
+`creationDate` / `description` / `arn` are additive. `10_verify_signature.sh` still only uses `publicKeyPem`.
+
+Verification of signatures produced by `08`/`09` is KMS ECDSA over SHA-256 of the artifact bytes. The signature is ASN.1 DER ECDSA (r,s). **That path is not OpenPGP**; `gpg --verify` will not work on those DER signatures.
 
 `./10_verify_signature.sh` fetches `/public-key` and uses Node `crypto.verify('sha256', fileBytes, pem, derSig)` on the current file (default: the path stored by `08`, usually `testdata/artifact.txt`). Changing that file after signing must fail. Pass another path to check a different file against the same signature.
+
+### OpenPGP public key (`GET /openpgp-public-key`)
+
+Query params `userName` and `userEmail` are required. Example:
+
+`GET {api_base_url}/openpgp-public-key?userName=Test&userEmail=test%40example.com`
+
+Returns JSON `{ ok, armored, fingerprint, keyCreationDate, userId }`. The `armored` value is a transferable OpenPGP public key (UID self-certification signed by KMS). OpenPGP key creation time is the KMS key creation date so fingerprints match kmspgp `lambda-sign`.
+
+This endpoint is for kmspgp (`lambda-export`) and `gpg --import`. Numbered scripts `08`–`10` do not call it and do not require `gpg`. OpenPGP document signatures still go through `create` + human approval; kmspgp wraps the resulting DER as OpenPGP.
 
 ## Out-of-scope integrations (documented only)
 
@@ -222,6 +247,7 @@ npm run typecheck
 ### Project layout
 ```
 src/index.ts                 # Lambda source
+src/openpgp.ts               # OpenPGP public-key export (used by GET /openpgp-public-key)
 testdata/artifact.txt        # Default file hashed by 08 / verified by 10
 infra/*.tf                   # Terraform: KMS, DynamoDB, SNS, API GW, Lambda, IAM
 infra/.terraform.lock.hcl    # Provider versions (tracked)
@@ -236,7 +262,7 @@ common.sh                    # Shared AWS / Terraform helpers
 07_subscribe_approver.sh     # SNS email subscription
 08_create_signing_request.sh # SHA-256 + Lambda invoke (create)
 09_poll_signing_request.sh   # GET pollUrl until SIGNED / FAILED / REJECTED
-10_verify_signature.sh       # Node ECDSA verify (not OpenPGP)
+10_verify_signature.sh       # Node ECDSA verify (not OpenPGP, not gpg)
 11_terraform_destroy.sh      # terraform destroy (keeps state bucket + HMAC SSM)
 ```
 
@@ -244,5 +270,6 @@ common.sh                    # Shared AWS / Terraform helpers
 
 - Costs are effectively zero when unused; pay-per-request DynamoDB, Lambda, API GW, and SNS scale with traffic.
 - Approval/poll tokens are HMAC-signed with an SSM SecureString secret and never logged.
-- Only the Lambda can call `kms:Sign`; the pipeline never gets that permission.
+- Only the Lambda can call `kms:Sign` for artifact signatures; the pipeline never gets that permission.
+- OpenPGP / `gpg` verification is exercised by kmspgp (`lambda-sign` / `lambda-export`) and the repo-root `import-lambda-and-verify.sh`, not by scripts `08`–`10`.
 
