@@ -25,6 +25,7 @@ kmslambda/node_modules/
 kmslambda/dist/
 kmslambda/npm-debug.log*
 kmslambda/*.tsbuildinfo
+kmslambda/signing.pub.asc
 kmslambda/last-signing-request.json
 kmslambda/infra/.terraform/
 kmslambda/infra/backend.hcl

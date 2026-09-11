@@ -27,6 +27,7 @@ infra/tfplan
 infra/tfplan.json
 
 # Script / test output
+signing.pub.asc
 last-signing-request.json
 testartifact.txt
 *.orig

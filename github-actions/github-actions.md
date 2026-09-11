@@ -16,8 +16,8 @@ Three actors, three credential sets:
 
 | Actor | Credentials | What they do |
 |-------|-------------|--------------|
-| **Admin** | Broad AWS (Terraform + IAM) and GitHub admin | Deploy kmslambda, invoke-export and commit the public key, create the OIDC role, set GitHub Environment values |
-| **Signing pipeline** | GitHub OIDC → IAM role | `lambda:InvokeFunction` only. Cannot create keys, cannot call `kms:Sign` |
+| **Admin** | Broad AWS (Terraform + IAM) and GitHub admin | Deploy kmslambda (writes the public key via the `export` alias), commit the pin, create the OIDC role, set GitHub Environment values |
+| **Signing pipeline** | GitHub OIDC → IAM role | `lambda:InvokeFunction` on the unqualified function only. Cannot invoke the `export` alias, cannot create keys, cannot call `kms:Sign` |
 | **Verifier** | None | GnuPG + `keys/signing.pub.asc` + the JAR and `.asc` from the GitHub Release |
 
 Do not put long-lived AWS access keys in GitHub secrets. The workflow uses `aws-actions/configure-aws-credentials` with `role-to-assume`. GitHub mints an OIDC token; AWS STS exchanges it for temporary credentials.
@@ -29,7 +29,7 @@ Human approval stays in kmslambda (SNS email). GitHub Environment protection her
 - AWS CLI v2. Export `AWS_PROFILE` to the profile that owns this stack (the same profile you already use for `aws` in this repo). Scripts honor `AWS_PROFILE` the same way [`kmslambda/common.sh`](../kmslambda/common.sh) does. Log in yourself (`aws sso login --profile "$AWS_PROFILE"` if you use SSO).
 - GitHub CLI (`gh`), authenticated to the repository (`gh auth login` if needed)
 - For kmslambda deploy: Terraform ≥ 1.5, Node.js 22+, npm, `openssl`
-- For a local dry-run of export/sign: Java 25+, Apache Maven 3.x, `./kmspgp/build.sh`
+- For a local dry-run of sign: Java 25+, Apache Maven 3.x, `./kmspgp/build.sh`
 
 Region comes from that profile or `AWS_REGION`. Setup scripts resolve the account at runtime with `sts get-caller-identity`; they do not hard-code account IDs, and they print the **profile name**, not the account id.
 
@@ -41,8 +41,10 @@ The approval service owns the KMS key, Lambda, API, and SNS topic. First deploy 
 export AWS_PROFILE=your-profile   # the CLI profile for this account
 # aws sso login --profile "$AWS_PROFILE"   # if the session expired
 
+mkdir -p keys
 ./kmslambda/deploy.sh \
-  --user-name "Release Signing" --user-email "security@example.com"
+  --user-name "Release Signing" --user-email "security@example.com" \
+  --out keys/signing.pub.asc
 ./kmslambda/approvers.sh add you@example.com
 # Confirm the AWS SNS email.
 
@@ -57,18 +59,14 @@ Details: [README — Approval service](../README.md#approval-service).
 
 ## 2. Pin the OpenPGP public key
 
-Admin step. Repeat only when the KMS key is rotated (new kmslambda key). Export is a Lambda invoke (`lambda:InvokeFunction`), not an HTTP GET.
+Admin step. Repeat only when the KMS key is rotated (new kmslambda key). `deploy.sh` invokes the `export` alias and writes the armored key (default `kmslambda/signing.pub.asc`, or `--out FILE`). That is not an HTTP GET. The pipeline's unqualified `lambda:InvokeFunction` cannot use the alias.
 
 ```bash
-./kmspgp/build.sh   # once, so dist/kmspgp.jar exists for the export wrapper
-. github-actions/.local/kmslambda.env
-
-mkdir -p keys
-./dist/lambda-export.sh --function "$KMSPGP_LAMBDA_FUNCTION_NAME" \
-  --out keys/signing.pub.asc
 ./verify.sh --check-pin keys/signing.pub.asc
 git add keys/signing.pub.asc
 ```
+
+If deploy wrote the default `kmslambda/signing.pub.asc` instead, copy that file here first.
 
 The armored file contains the OpenPGP User ID (public by design). It does not contain AWS account identifiers.
 
@@ -86,7 +84,7 @@ The trust policy allows `sts:AssumeRoleWithWebIdentity` only when:
 
 `setup-oidc-role.sh` reads `OWNER_ID` / `REPO_ID` from `gh api` (or `--owner-id` / `--repo-id`). Do not guess the name-only `sub` (`repo:OWNER/REPO:environment:…`); CloudTrail `userIdentity.userName` is the `sub` AWS actually saw. Older GitHub repos that never opted into immutable claims still emit the name-only format — change the template if you are integrating an old repository.
 
-The permissions policy is a single statement: `lambda:InvokeFunction` on the kmslambda function ARN.
+The permissions policy is a single statement: `lambda:InvokeFunction` on the **unqualified** kmslambda function ARN (`$LATEST`). That does not grant the `export` alias.
 
 ```bash
 . github-actions/.local/kmslambda.env
@@ -126,7 +124,8 @@ Push the workflow file, this guide, and `keys/signing.pub.asc` to `main` before 
 1. On GitHub: **Actions → Release kmspgp.jar → Run workflow** (branch `main`).
 2. The job builds the JAR, checks that the pin has exactly one primary key, then assumes the IAM role.
 3. `lambda-sign.sh --function …` waits up to 30 minutes. The sign step logs the artifact path, OpenPGP digest, and `hashedAt`. Approve the SNS email while it waits; compare those fields with the job log. The job timeout is 40 minutes.
-4. GitHub Release `kmspgp-<shortsha>` is created with `kmspgp-<shortsha>.jar` and `kmspgp-<shortsha>.jar.asc`. AWS credentials are unset before `gh release create`.
+4. After sign, `verify.sh --pubkey keys/signing.pub.asc` checks the JAR against the pin and the new `.asc`. The job fails if GnuPG does not verify.
+5. GitHub Release `kmspgp-<shortsha>` is created with `kmspgp-<shortsha>.jar` and `kmspgp-<shortsha>.jar.asc`. AWS credentials are unset before `gh release create`.
 
 Re-running the same commit fails if the tag already exists. That is intentional: a SHA maps to one Release. If sign succeeded and upload failed, delete the tag/release only when you intend to produce a new signature for the same bytes.
 
@@ -144,10 +143,10 @@ gh release download kmspgp-SHORTSHA --pattern 'kmspgp-*'
 
 Keep kmslambda as-is. Copy [`github-actions/`](.) and adjust:
 
-1. Pin **your** OpenPGP public key in git (same export command, different path if you prefer).
+1. Pin **your** OpenPGP public key in git (`deploy.sh --out`, different path if you prefer).
 2. Point `job_workflow_ref` in `trust-policy.json` at **your** workflow file and branch.
 3. Use a GitHub Environment name and IAM role name that match that pipeline.
-4. Grant the role `lambda:InvokeFunction` on the same function (or another kmslambda you deploy).
+4. Grant the role `lambda:InvokeFunction` on the same **unqualified** function ARN (or another kmslambda you deploy). Do not grant the `export` alias.
 5. Put `AWS_ROLE_ARN` / region / function name in that Environment, not in the workflow file.
 6. Call `./dist/lambda-sign.sh --function …` (or `java -jar kmspgp.jar lambda-sign --function …`) on the artifact you actually ship. The JAR in this repo is both the tool and the dogfood artifact; other pipelines only need it as the signer client.
 
@@ -171,7 +170,7 @@ Deletes the IAM role and inline policy. Leaves the account-level GitHub OIDC pro
 | `lambda:InvokeFunction` denied | Permissions policy ARN does not match the function the workflow invokes; re-run `setup-oidc-role.sh` after sourcing `config.sh` |
 | Job hits 40 minutes | Nobody approved; kmslambda poll timeout is 30 minutes |
 | Email digest or artifact path does not match the Actions log | Approve only if they match. Recalculate with kmspgp from the artifact plus `hashedAt` (not `sha256sum`) |
-| GnuPG verify fails after a key rotation | `keys/signing.pub.asc` was not updated; re-export and commit the pin |
+| GnuPG verify fails after a key rotation | `keys/signing.pub.asc` was not updated; re-deploy (or `lambda-export.sh`) and commit the pin |
 | Pin check fails (`exactly one primary OpenPGP key`) | Extra keys in the pin; export a single primary key |
 | Release create fails with tag exists | That commit already has a Release; use a new commit or delete the tag only if you mean to re-sign |
 | `kmspgp.jar not found` | `./kmspgp/build.sh` did not run or Java/Maven is missing on the runner |

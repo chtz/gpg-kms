@@ -1,4 +1,4 @@
-import { APIGatewayProxyStructuredResultV2 } from 'aws-lambda';
+import { APIGatewayProxyStructuredResultV2, Context } from 'aws-lambda';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
   DynamoDBDocumentClient,
@@ -639,13 +639,7 @@ async function handleGetRequestStatus(event: any) {
   try {
     const rid: string | undefined = event.pathParameters?.id || event.pathParameters?.requestId;
     if (!rid) return jsonResponse(400, { ok: false, error: 'Missing request id' });
-    // Token via query or Authorization: Bearer <token>
-    const token =
-      event.queryStringParameters?.token ||
-      (event.headers?.authorization || event.headers?.Authorization || '')
-        .toString()
-        .replace(/^Bearer\s+/i, '')
-        .trim();
+    const token = event.queryStringParameters?.token || '';
     if (!token) return jsonResponse(401, { ok: false, error: 'Missing token' });
     let payload: TokenPayload;
     try {
@@ -791,9 +785,23 @@ async function handleHttp(event: any): Promise<APIGatewayProxyStructuredResultV2
 }
 
 // ---------- Lambda Invoke (create / export) ----------
-async function handleInvoke(event: any) {
+const EXPORT_ALIAS = 'export';
+
+function invokedViaExportAlias(context: Context): boolean {
+  const arn = context.invokedFunctionArn || '';
+  const name = context.functionName || '';
+  const marker = `:function:${name}:`;
+  const i = arn.lastIndexOf(marker);
+  if (i < 0) return false;
+  return arn.slice(i + marker.length) === EXPORT_ALIAS;
+}
+
+async function handleInvoke(event: any, context: Context) {
   const action = event?.action;
   if (action === 'export') {
+    if (!invokedViaExportAlias(context)) {
+      return { ok: false, error: 'export requires the export alias' };
+    }
     try {
       const exported = await exportOpenPgp();
       return { ok: true, ...exported };
@@ -808,12 +816,12 @@ async function handleInvoke(event: any) {
 }
 
 // ---------- Handler ----------
-export const handler = async (event: any): Promise<any> => {
+export const handler = async (event: any, context: Context): Promise<any> => {
   try {
     if (isHttpEvent(event)) {
       return await handleHttp(event);
     }
-    return await handleInvoke(event);
+    return await handleInvoke(event, context);
   } catch (err: any) {
     console.error(JSON.stringify({ level: 'error', msg: 'Unhandled error', error: err?.message }));
     if (isHttpEvent(event)) {

@@ -138,7 +138,7 @@ resource "aws_apigatewayv2_stage" "stage" {
 }
 
 # ---------- Lambda packaging ----------
-# Built by ../04_build.sh (dist/index.js). Plan/apply fail if that file is missing.
+# Built by deploy.sh / npm run build (dist/index.js). Plan/apply fail if that file is missing.
 data "archive_file" "lambda_zip" {
   type        = "zip"
   source_file = "${path.module}/../dist/index.js"
@@ -191,15 +191,6 @@ data "aws_iam_policy_document" "lambda_policy" {
     ]
     resources = [local.approval_param_arn]
   }
-
-  # To retrieve SecureString with decryption, lambda also needs kms:Decrypt on the KMS key used by SSM (usually alias/aws/ssm)
-  statement {
-    sid = "AllowKmsDecryptForSsm"
-    actions = [
-      "kms:Decrypt"
-    ]
-    resources = ["arn:aws:kms:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:alias/aws/ssm"]
-  }
 }
 
 resource "aws_iam_role_policy" "lambda_inline" {
@@ -216,6 +207,7 @@ resource "aws_lambda_function" "main" {
   handler          = "index.handler"
   filename         = data.archive_file.lambda_zip.output_path
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+  publish          = true
 
   environment {
     variables = {
@@ -228,11 +220,19 @@ resource "aws_lambda_function" "main" {
       OPENPGP_USER_EMAIL       = trimspace(var.openpgp_user_email)
       REQUEST_TTL_SECONDS      = tostring(var.request_ttl_seconds)
       APPROVAL_TTL_SECONDS     = tostring(var.approval_ttl_seconds)
-      NODE_OPTIONS             = "--enable-source-maps"
     }
   }
 
   depends_on = [aws_iam_role_policy.lambda_inline]
+}
+
+# Aliases cannot point at $LATEST. Pipeline InvokeFunction is on the unqualified
+# ARN ($LATEST) and cannot invoke this alias. Export is admin-only.
+resource "aws_lambda_alias" "export" {
+  name             = "export"
+  description      = "Admin OpenPGP public-key export"
+  function_name    = aws_lambda_function.main.function_name
+  function_version = aws_lambda_function.main.version
 }
 
 resource "aws_cloudwatch_log_group" "lambda" {

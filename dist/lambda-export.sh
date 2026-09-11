@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Export an OpenPGP public key from a deployed kmslambda stack (Lambda invoke).
-# Jar must sit next to this script.
+# Export an OpenPGP public key from a deployed kmslambda stack (export alias).
+# Jar must sit next to this script. Pass the unqualified function name; :export is appended.
 # Usage: lambda-export.sh --function NAME --out FILE
 set -euo pipefail
 
@@ -34,7 +34,7 @@ if [[ -z "$OUT" ]]; then
 fi
 
 mkdir -p "$(dirname "$OUT")"
-echo "Exporting OpenPGP public key from kmslambda:" >&2
+echo "Exporting OpenPGP public key from kmslambda (export alias):" >&2
 echo "  function: $FUNCTION" >&2
 echo "  file:     $OUT" >&2
 kmspgp lambda-export --function "$FUNCTION" > "$OUT"

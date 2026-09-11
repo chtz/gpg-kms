@@ -8,8 +8,6 @@ TFVARS="$INFRA_DIR/terraform.tfvars"
 TFPLAN="$INFRA_DIR/tfplan"
 STATE_KEY="kmslambda/terraform.tfstate"
 APPROVAL_HMAC_PARAM_NAME="${APPROVAL_HMAC_PARAM_NAME:-/artifact-signing/approval-hmac}"
-LAST_REQUEST_FILE="$KMSLAMBDA_DIR/last-signing-request.json"
-DEFAULT_ARTIFACT="$KMSLAMBDA_DIR/testdata/artifact.txt"
 
 require_aws() {
   if ! command -v aws >/dev/null 2>&1; then
@@ -120,13 +118,6 @@ require_lambda_build() {
   fi
 }
 
-require_tfplan() {
-  if [[ ! -f "$TFPLAN" ]]; then
-    echo "Missing $TFPLAN. Run ./deploy.sh --plan first." >&2
-    exit 1
-  fi
-}
-
 ensure_hmac_secret() {
   echo "HMAC secret:"
   echo "  parameter: $APPROVAL_HMAC_PARAM_NAME"
@@ -213,7 +204,7 @@ build_lambda() {
   ensure_node_modules
   echo "Building Lambda bundle in $KMSLAMBDA_DIR"
   echo
-  (cd "$KMSLAMBDA_DIR" && npm run build)
+  (cd "$KMSLAMBDA_DIR" && npm run typecheck && npm run build)
   echo
   echo "Built dist/index.js"
   echo
@@ -266,6 +257,68 @@ tf_output() {
 tf_output_optional() {
   local name="$1"
   tf output -raw "$name" 2>/dev/null || true
+}
+
+LAMBDA_EXPORT_ALIAS="export"
+
+qualify_lambda_export() {
+  local name="$1"
+  if [[ "$name" == *":${LAMBDA_EXPORT_ALIAS}" ]]; then
+    printf '%s\n' "$name"
+  else
+    printf '%s:%s\n' "$name" "$LAMBDA_EXPORT_ALIAS"
+  fi
+}
+
+# Invoke the export alias and write the armored OpenPGP public key to $2.
+export_openpgp_public_key() {
+  local function_name="$1"
+  local out="$2"
+  local target resp
+  require_node
+  target="$(qualify_lambda_export "$function_name")"
+  mkdir -p "$(dirname "$out")"
+  resp="$(mktemp)"
+  echo "Exporting OpenPGP public key:" >&2
+  echo "  function: $target" >&2
+  echo "  file:     $out" >&2
+  if ! aws_cli lambda invoke \
+      --function-name "$target" \
+      --cli-binary-format raw-in-base64-out \
+      --payload '{"action":"export"}' \
+      "$resp" >/dev/null; then
+    echo "lambda invoke failed" >&2
+    rm -f "$resp"
+    return 1
+  fi
+  if ! node -e '
+    const fs = require("fs");
+    const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (data.errorMessage || data.errorType) {
+      console.error(data.errorMessage || data.errorType || "Lambda error");
+      process.exit(1);
+    }
+    if (!data.ok) {
+      console.error(data.error || "export failed");
+      process.exit(1);
+    }
+    const armored = String(data.armored || "").replace(/\s+$/, "");
+    if (!armored) {
+      console.error("export response missing armored");
+      process.exit(1);
+    }
+    fs.writeFileSync(process.argv[2], armored + "\n");
+    if (data.fingerprint) console.error("  fingerprint: " + data.fingerprint);
+    if (data.userId) console.error("  uid:         " + data.userId);
+  ' "$resp" "$out"; then
+    echo "Export response:" >&2
+    cat "$resp" >&2
+    echo >&2
+    rm -f "$resp"
+    return 1
+  fi
+  rm -f "$resp"
+  echo "Wrote $out" >&2
 }
 
 hcl_quote() {

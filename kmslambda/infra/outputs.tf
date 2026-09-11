@@ -4,8 +4,13 @@ output "api_base_url" {
 }
 
 output "lambda_function_name" {
-  description = "Lambda function name"
+  description = "Lambda function name (unqualified; signing pipeline invoke)"
   value       = aws_lambda_function.main.function_name
+}
+
+output "lambda_export_function_name" {
+  description = "Function name qualified with the export alias (admin invoke)"
+  value       = "${aws_lambda_function.main.function_name}:${aws_lambda_alias.export.name}"
 }
 
 output "dynamodb_table_name" {

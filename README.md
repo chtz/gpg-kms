@@ -91,32 +91,32 @@ echo "hello" > "$WORK/example-1.0.0.txt"
 
 Also needs Terraform ≥ 1.5, Node.js 22+, npm, `openssl`.
 
-Name and email are bound at deploy (kept in gitignored `kmslambda/infra/terraform.tfvars` so later deploys reuse them). Export via Lambda invoke always returns that User ID.
+Name and email are bound at deploy (kept in gitignored `kmslambda/infra/terraform.tfvars` so later deploys reuse them). If the KMS key has a description, export appends it as an OpenPGP comment, so re-export can change armor/UID text while the fingerprint stays the same — do not strip that comment to "fix" the UID. Export via the Lambda `export` alias always returns that User ID.
 
 Both backends wrap the KMS signature the same way: OpenPGP packet from DER + fingerprint. Direct KMS derives the fingerprint from `GetPublicKey` plus the key creation date. kmslambda returns `signature` and `fingerprint` on a `SIGNED` poll. The pin file is for **verify**, not for sign.
 
 ### Admin: deploy, approvers, export
 
-The stack includes the KMS key and Lambda. Only the Lambda role may call `kms:Sign` on that key. HTTP is approve and poll only — no public-key routes. Publish `$WORK/signing.pub.asc` as the pinned root of trust.
+The stack includes the KMS key and Lambda. Only the Lambda role may call `kms:Sign` on that key. HTTP is approve and poll only — no public-key routes. Deploy invokes the `export` alias and writes the armored key; publish that file as the pinned root of trust. The pipeline's `lambda:InvokeFunction` is on the unqualified function ARN (`$LATEST`) and cannot use the alias.
 
 **Needs:** AWS credentials that can apply the Terraform stack (KMS, Lambda, API Gateway, DynamoDB, SNS, IAM, SSM, S3, CloudWatch). First deploy requires `--user-name` and `--user-email` (or `KMSPGP_USER_NAME` / `KMSPGP_USER_EMAIL`).  
-**Export permissions:** `lambda:InvokeFunction` (not `kms:Sign`).  
+**Export permissions:** `lambda:InvokeFunction` on the function's `export` alias (not `kms:Sign`).  
 **Produces:** `$WORK/env` for the signing pipeline (`KMSPGP_LAMBDA_FUNCTION_NAME`, `AWS_REGION`; `KMSPGP_LAMBDA_API_BASE_URL` is informational), `$WORK/signing.pub.asc` for verifiers.
 
 ```bash
 WORK=$(mktemp -d)
 
 ./kmslambda/deploy.sh \
-  --user-name "Release Signing" --user-email "security@example.com"
+  --user-name "Release Signing" --user-email "security@example.com" \
+  --out "$WORK/signing.pub.asc"
 ./kmslambda/approvers.sh add you@example.com
 # Confirm the AWS SNS email before the first sign.
 
 ./kmslambda/config.sh > "$WORK/env"
 . "$WORK/env"
-
-./dist/lambda-export.sh --function "$KMSPGP_LAMBDA_FUNCTION_NAME" \
-  --out "$WORK/signing.pub.asc"
 ```
+
+Re-export without a full apply: `./dist/lambda-export.sh --function "$KMSPGP_LAMBDA_FUNCTION_NAME" --out "$WORK/signing.pub.asc"` (invokes `:export`).
 
 ### Signing pipeline
 

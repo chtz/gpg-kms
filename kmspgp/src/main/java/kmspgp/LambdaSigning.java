@@ -20,11 +20,17 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 final class LambdaSigning {
+    private static final String EXPORT_ALIAS = "export";
+    private static final HttpClient HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(10))
+            .followRedirects(HttpClient.Redirect.NEVER)
+            .build();
+
     private LambdaSigning() {}
 
     static String exportPublicKey(String functionName) throws Exception {
         var payload = Map.of("action", "export");
-        var json = invoke(functionName, payload);
+        var json = invoke(qualifyExport(functionName), payload);
         if (!Json.bool(json, "ok")) {
             throw new IllegalStateException(message(json, "export failed"));
         }
@@ -112,6 +118,10 @@ final class LambdaSigning {
                         + (lastStatus.isBlank() ? "unknown" : lastStatus) + ")");
     }
 
+    private static String qualifyExport(String functionName) {
+        return functionName.endsWith(":" + EXPORT_ALIAS) ? functionName : functionName + ":" + EXPORT_ALIAS;
+    }
+
     private static Map<String, Object> invoke(String functionName, Map<String, ?> payload)
             throws Exception {
         String responseJson;
@@ -130,17 +140,23 @@ final class LambdaSigning {
     }
 
     private static String httpGet(String url) throws Exception {
-        var client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
-        var request = HttpRequest.newBuilder(URI.create(url))
+        var uri = URI.create(url);
+        var request = HttpRequest.newBuilder(uri)
                 .timeout(Duration.ofSeconds(30))
                 .GET()
                 .build();
-        var response = client.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        var response = HTTP.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
         if (response.statusCode() / 100 != 2) {
-            throw new IllegalStateException("HTTP " + response.statusCode() + " from " + url + ": "
-                    + response.body());
+            throw new IllegalStateException("HTTP " + response.statusCode() + " from "
+                    + requestTarget(uri) + ": " + response.body());
         }
         return response.body();
+    }
+
+    private static String requestTarget(URI uri) {
+        var host = uri.getHost() == null ? "" : uri.getHost();
+        var path = uri.getRawPath() == null || uri.getRawPath().isEmpty() ? "/" : uri.getRawPath();
+        return host + path;
     }
 
     private static LambdaClient lambda() {

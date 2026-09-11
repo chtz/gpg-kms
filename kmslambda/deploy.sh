@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Deploy the approval-gated signing service.
-# Usage: deploy.sh [--plan] [--user-name NAME] [--user-email EMAIL]
+# Usage: deploy.sh [--plan] [--user-name NAME] [--user-email EMAIL] [--out FILE]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,21 +8,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 usage() {
-  echo "Usage: $0 [--plan] [--user-name NAME] [--user-email EMAIL]" >&2
+  echo "Usage: $0 [--plan] [--user-name NAME] [--user-email EMAIL] [--out FILE]" >&2
   echo "First deploy requires --user-name and --user-email (or KMSPGP_USER_NAME / KMSPGP_USER_EMAIL)." >&2
   echo "Later deploys reuse $TFVARS (gitignored)." >&2
+  echo "After apply, invokes the export alias and writes the OpenPGP public key to FILE" >&2
+  echo "(default: $SCRIPT_DIR/signing.pub.asc)." >&2
   exit 1
 }
 
 PLAN_ONLY=0
 USER_NAME="${KMSPGP_USER_NAME:-}"
 USER_EMAIL="${KMSPGP_USER_EMAIL:-}"
+EXPORT_OUT=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --plan) PLAN_ONLY=1; shift ;;
     --user-name) [[ $# -ge 2 ]] || usage; USER_NAME="$2"; shift 2 ;;
     --user-email) [[ $# -ge 2 ]] || usage; USER_EMAIL="$2"; shift 2 ;;
+    --out) [[ $# -ge 2 ]] || usage; EXPORT_OUT="$2"; shift 2 ;;
     -h|--help) usage ;;
     *) usage ;;
   esac
@@ -67,8 +71,14 @@ echo
 echo "Deployed. Terraform outputs:"
 tf output
 echo
+
+if [[ -z "$EXPORT_OUT" ]]; then
+  EXPORT_OUT="$SCRIPT_DIR/signing.pub.asc"
+fi
+export_openpgp_public_key "$(tf_output lambda_export_function_name)" "$EXPORT_OUT"
+echo
 echo "Next:"
 echo "  ./approvers.sh add you@example.com"
 echo "  # confirm the AWS SNS email, then"
 echo "  ./config.sh > envfile && . ./envfile"
-echo "  ../dist/lambda-export.sh --function \"\$KMSPGP_LAMBDA_FUNCTION_NAME\" --out keys/signing.pub.asc"
+echo "  # publish $EXPORT_OUT as the pinned public key (e.g. keys/signing.pub.asc)"
