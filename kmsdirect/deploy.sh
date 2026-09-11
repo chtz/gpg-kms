@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
-# Create a KMS asymmetric SIGN_VERIFY test key for kmspgp.
-# Uses the current AWS_PROFILE and the region already configured for the AWS CLI.
+# Create or reuse a KMS ECC_NIST_P256 SIGN_VERIFY key (direct backend).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=test_key_common.sh
-source "$SCRIPT_DIR/test_key_common.sh"
+# shellcheck source=common.sh
+source "$SCRIPT_DIR/common.sh"
 
 KEY_SPEC="ECC_NIST_P256"
-DESCRIPTION="kmspgp test signing key (safe to delete)"
+DESCRIPTION="Artifact signing key (KMS) for kmspgp"
 
 init_aws
 
-echo "Creating kmspgp test key with:"
+echo "Deploying direct KMS signing key:"
 echo "  profile: ${PROFILE:-<default>}"
 echo "  region:  $REGION"
 echo "  alias:   $ALIAS_NAME"
@@ -25,7 +24,7 @@ create_new_key() {
     --key-usage SIGN_VERIFY \
     --key-spec "$KEY_SPEC" \
     --description "$DESCRIPTION" \
-    --tags "TagKey=Purpose,TagValue=kmspgp-test" "TagKey=Name,TagValue=kmspgp-test-signing" \
+    --tags "TagKey=Purpose,TagValue=artifact-signing" "TagKey=Name,TagValue=kmspgp-signing" \
     --query 'KeyMetadata.KeyId' \
     --output text)"
 
@@ -56,17 +55,5 @@ fi
 echo "  alias: $ALIAS_NAME"
 echo "  arn:   $key_arn"
 echo
-echo "kmspgp uses the AWS SDK default credential and region chain."
-if [[ -n "$PROFILE" ]]; then
-  echo "  AWS_PROFILE=$PROFILE  (region $REGION from this profile unless AWS_REGION is set)"
-else
-  echo "  region $REGION from the default profile unless AWS_REGION is set"
-fi
-echo
-echo "Try it:"
-echo "  mvn clean install"
-echo "  ./export_test_key.sh"
-echo "  ./import_test_key.sh"
-echo "  ./sign_with_test_key.sh"
-echo "  ./verify_with_test_key.sh"
-echo "  ./delete_test_key.sh"
+echo "Next:"
+echo "  ./config.sh > envfile && . ./envfile"

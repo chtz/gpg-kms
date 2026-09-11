@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# Delete the kmspgp test-key alias and schedule the KMS key for deletion.
-# Uses the current AWS_PROFILE and the region already configured for the AWS CLI.
+# Delete the direct-KMS signing alias and schedule the key for deletion.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=test_key_common.sh
-source "$SCRIPT_DIR/test_key_common.sh"
+# shellcheck source=common.sh
+source "$SCRIPT_DIR/common.sh"
 
 PENDING_WINDOW_DAYS="${KMS_PENDING_WINDOW_DAYS:-7}"
 
@@ -16,14 +15,14 @@ if ! [[ "$PENDING_WINDOW_DAYS" =~ ^[0-9]+$ ]] || (( PENDING_WINDOW_DAYS < 7 || P
   exit 1
 fi
 
-if ! key_id="$(lookup_test_key_id)"; then
+if ! key_id="$(lookup_signing_key_id)"; then
   exit 1
 fi
 
 key_arn="$(aws_kms describe-key --key-id "$key_id" --query 'KeyMetadata.Arn' --output text)"
 key_state="$(aws_kms describe-key --key-id "$key_id" --query 'KeyMetadata.KeyState' --output text)"
 
-echo "Scheduling kmspgp test key for deletion:"
+echo "Undeploying direct KMS signing key:"
 echo "  profile: ${PROFILE:-<default>}"
 echo "  region:  $REGION"
 echo "  alias:   $ALIAS_NAME"
@@ -47,5 +46,5 @@ else
 fi
 
 echo
-echo "Create a new test key with:"
-echo "  ./create_test_key.sh"
+echo "Deploy again with:"
+echo "  ./deploy.sh"

@@ -15,11 +15,17 @@ import java.util.HexFormat;
 public final class Main {
     private static final String USAGE =
             "usage: export --user-name NAME --user-email EMAIL KEY | -bsau KEY"
-                    + " | lambda-export --user-name NAME --user-email EMAIL"
-                    + " | lambda-sign [--artifact NAME] [--version VER] [--environment ENV]";
+                    + " | lambda-export --api URL"
+                    + " | lambda-sign --function NAME --api URL"
+                    + " [--artifact NAME] [--version VER] [--environment ENV]";
+    private static final int LAMBDA_POLL_INTERVAL_SECONDS = 2;
+    private static final int LAMBDA_POLL_TIMEOUT_SECONDS = 1800;
 
     public static void main(String[] args) throws Exception {
-        if (args.length >= 2 && "-bsau".equals(args[0])) {
+        if (args.length >= 1 && "-bsau".equals(args[0])) {
+            if (args.length != 2) {
+                fail("usage: -bsau KEY");
+            }
             sign(args[1]);
         } else if (args.length >= 1 && "export".equals(args[0])) {
             export(parseExport(args));
@@ -60,17 +66,11 @@ public final class Main {
     }
 
     private static void lambdaExport(LambdaExportArgs opts) throws Exception {
-        var api = requireEnv("KMSPGP_LAMBDA_API_BASE_URL");
-        System.out.println(LambdaSigning.fetchOpenPgpPublicKey(api, opts.userName, opts.userEmail));
+        System.out.println(LambdaSigning.fetchOpenPgpPublicKey(opts.api));
     }
 
     private static void lambdaSign(LambdaSignArgs opts) throws Exception {
-        var api = requireEnv("KMSPGP_LAMBDA_API_BASE_URL");
-        var functionName = requireEnv("KMSPGP_LAMBDA_FUNCTION_NAME");
-        var interval = envInt("KMSPGP_LAMBDA_POLL_INTERVAL_SECONDS", 2);
-        var timeout = envInt("KMSPGP_LAMBDA_POLL_TIMEOUT_SECONDS", 1800);
-
-        var remote = LambdaSigning.fetchPublicKey(api);
+        var remote = LambdaSigning.fetchPublicKey(opts.api);
         if (remote.keySpec() != null && !"ECC_NIST_P256".equals(remote.keySpec())) {
             throw new IllegalArgumentException("Only ECC_NIST_P256 is supported, got " + remote.keySpec());
         }
@@ -84,14 +84,14 @@ public final class Main {
         var artifact = opts.artifact != null ? opts.artifact : "stdin";
         System.out.println(Pgp.sign(Instant.now(), openPgp, pub, digest ->
                 LambdaSigning.signDigest(
-                        functionName,
+                        opts.functionName,
                         digest,
                         fileSha256,
                         artifact,
                         opts.version,
                         opts.environment,
-                        interval,
-                        timeout)));
+                        LAMBDA_POLL_INTERVAL_SECONDS,
+                        LAMBDA_POLL_TIMEOUT_SECONDS)));
     }
 
     private static Key load(KmsClient kms, String keyId) {
@@ -134,34 +134,41 @@ public final class Main {
     }
 
     private static LambdaExportArgs parseLambdaExport(String[] args) {
-        String userName = null;
-        String userEmail = null;
+        String api = null;
         for (int i = 1; i < args.length; i++) {
             switch (args[i]) {
-                case "--user-name" -> userName = requireValue(args, ++i, "--user-name");
-                case "--user-email" -> userEmail = requireValue(args, ++i, "--user-email");
-                default -> fail("usage: lambda-export --user-name NAME --user-email EMAIL");
+                case "--api" -> api = requireValue(args, ++i, "--api");
+                default -> fail("usage: lambda-export --api URL");
             }
         }
-        if (userName == null || userEmail == null) {
-            fail("usage: lambda-export --user-name NAME --user-email EMAIL");
+        if (api == null) {
+            fail("usage: lambda-export --api URL");
         }
-        return new LambdaExportArgs(userName, userEmail);
+        return new LambdaExportArgs(api);
     }
 
     private static LambdaSignArgs parseLambdaSign(String[] args) {
+        String functionName = null;
+        String api = null;
         String artifact = null;
         String version = null;
         String environment = null;
         for (int i = 1; i < args.length; i++) {
             switch (args[i]) {
+                case "--function" -> functionName = requireValue(args, ++i, "--function");
+                case "--api" -> api = requireValue(args, ++i, "--api");
                 case "--artifact" -> artifact = requireValue(args, ++i, "--artifact");
                 case "--version" -> version = requireValue(args, ++i, "--version");
                 case "--environment" -> environment = requireValue(args, ++i, "--environment");
-                default -> fail("usage: lambda-sign [--artifact NAME] [--version VER] [--environment ENV]");
+                default -> fail("usage: lambda-sign --function NAME --api URL"
+                        + " [--artifact NAME] [--version VER] [--environment ENV]");
             }
         }
-        return new LambdaSignArgs(artifact, version, environment);
+        if (functionName == null || api == null) {
+            fail("usage: lambda-sign --function NAME --api URL"
+                    + " [--artifact NAME] [--version VER] [--environment ENV]");
+        }
+        return new LambdaSignArgs(functionName, api, artifact, version, environment);
     }
 
     private static String userId(String userName, String userEmail, String description) {
@@ -170,31 +177,6 @@ public final class Main {
             user += " (" + description.trim() + ")";
         }
         return user;
-    }
-
-    private static String requireEnv(String name) {
-        var value = System.getenv(name);
-        if (value == null || value.isBlank()) {
-            fail(name + " is required");
-        }
-        return value;
-    }
-
-    private static int envInt(String name, int defaultValue) {
-        var value = System.getenv(name);
-        if (value == null || value.isBlank()) {
-            return defaultValue;
-        }
-        try {
-            var parsed = Integer.parseInt(value);
-            if (parsed <= 0) {
-                fail(name + " must be a positive integer");
-            }
-            return parsed;
-        } catch (NumberFormatException e) {
-            fail(name + " must be a positive integer");
-            return defaultValue;
-        }
     }
 
     private static String requireValue(String[] args, int i, String option) {
@@ -212,9 +194,15 @@ public final class Main {
 
     private record ExportArgs(String userName, String userEmail, String keyId) {}
 
-    private record LambdaExportArgs(String userName, String userEmail) {}
+    private record LambdaExportArgs(String api) {}
 
-    private record LambdaSignArgs(String artifact, String version, String environment) {}
+    private record LambdaSignArgs(
+            String functionName,
+            String api,
+            String artifact,
+            String version,
+            String environment
+    ) {}
 
     private record Key(
             software.amazon.awssdk.services.kms.model.DescribeKeyResponse des,

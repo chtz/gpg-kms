@@ -8,7 +8,6 @@ import software.amazon.awssdk.services.lambda.LambdaClient;
 import software.amazon.awssdk.services.lambda.model.InvokeRequest;
 
 import java.net.URI;
-import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -54,12 +53,8 @@ final class LambdaSigning {
                 Json.str(json, "description"));
     }
 
-    static String fetchOpenPgpPublicKey(String apiBaseUrl, String userName, String userEmail)
-            throws Exception {
-        var url = join(apiBaseUrl, "/openpgp-public-key")
-                + "?userName=" + URLEncoder.encode(userName, StandardCharsets.UTF_8)
-                + "&userEmail=" + URLEncoder.encode(userEmail, StandardCharsets.UTF_8);
-        var json = Json.object(httpGet(url));
+    static String fetchOpenPgpPublicKey(String apiBaseUrl) throws Exception {
+        var json = Json.object(httpGet(join(apiBaseUrl, "/openpgp-public-key")));
         if (!Json.bool(json, "ok")) {
             throw new IllegalStateException(message(json, "openpgp-public-key request failed"));
         }

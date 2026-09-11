@@ -176,6 +176,8 @@ resource "aws_lambda_function" "main" {
       SNS_TOPIC_ARN            = aws_sns_topic.approvals.arn
       API_BASE_URL             = local.api_base_url
       APPROVAL_HMAC_PARAM_NAME = local.param_full_name
+      OPENPGP_USER_NAME        = trimspace(var.openpgp_user_name)
+      OPENPGP_USER_EMAIL       = trimspace(var.openpgp_user_email)
       REQUEST_TTL_SECONDS      = tostring(var.request_ttl_seconds)
       APPROVAL_TTL_SECONDS     = tostring(var.approval_ttl_seconds)
       NODE_OPTIONS             = "--enable-source-maps"

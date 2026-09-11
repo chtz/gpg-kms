@@ -1,4 +1,4 @@
-# Isolated GnuPG home used by the test-key scripts
+# Leftover isolated GnuPG homes (not used by product wrappers)
 gpg_temp/
 gpg_temp_lambda/
 

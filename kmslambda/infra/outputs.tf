@@ -28,3 +28,13 @@ output "kms_key_arn" {
   value       = aws_kms_key.signing.arn
 }
 
+output "openpgp_user_name" {
+  description = "OpenPGP User ID name bound at deploy"
+  value       = trimspace(var.openpgp_user_name)
+}
+
+output "openpgp_user_email" {
+  description = "OpenPGP User ID email bound at deploy"
+  value       = trimspace(var.openpgp_user_email)
+}
+

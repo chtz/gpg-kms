@@ -20,12 +20,22 @@ const {
   SNS_TOPIC_ARN,
   API_BASE_URL,
   APPROVAL_HMAC_PARAM_NAME,
+  OPENPGP_USER_NAME,
+  OPENPGP_USER_EMAIL,
 } = process.env;
 
 const REQUEST_TTL_SECONDS = parseInt(process.env.REQUEST_TTL_SECONDS || '3600', 10);
 const APPROVAL_TTL_SECONDS = parseInt(process.env.APPROVAL_TTL_SECONDS || '1800', 10);
 
-if (!TABLE_NAME || !KMS_KEY_ID || !SNS_TOPIC_ARN || !API_BASE_URL || !APPROVAL_HMAC_PARAM_NAME) {
+if (
+  !TABLE_NAME ||
+  !KMS_KEY_ID ||
+  !SNS_TOPIC_ARN ||
+  !API_BASE_URL ||
+  !APPROVAL_HMAC_PARAM_NAME ||
+  !OPENPGP_USER_NAME ||
+  !OPENPGP_USER_EMAIL
+) {
   // We don't throw here to avoid Lambda init failure; checks occur at runtime paths as well.
   console.warn(
     JSON.stringify({
@@ -37,6 +47,8 @@ if (!TABLE_NAME || !KMS_KEY_ID || !SNS_TOPIC_ARN || !API_BASE_URL || !APPROVAL_H
         SNS_TOPIC_ARN: !!SNS_TOPIC_ARN,
         API_BASE_URL: !!API_BASE_URL,
         APPROVAL_HMAC_PARAM_NAME: !!APPROVAL_HMAC_PARAM_NAME,
+        OPENPGP_USER_NAME: !!OPENPGP_USER_NAME,
+        OPENPGP_USER_EMAIL: !!OPENPGP_USER_EMAIL,
       },
     })
   );
@@ -740,12 +752,12 @@ async function handleGetPublicKey() {
 
 const openPgpCache = new Map<string, OpenPgpPublicKey>();
 
-async function handleGetOpenPgpPublicKey(event: any) {
+async function handleGetOpenPgpPublicKey() {
   try {
-    const userName = (event.queryStringParameters?.userName || '').trim();
-    const userEmail = (event.queryStringParameters?.userEmail || '').trim();
+    const userName = (OPENPGP_USER_NAME || '').trim();
+    const userEmail = (OPENPGP_USER_EMAIL || '').trim();
     if (!userName || !userEmail) {
-      return jsonResponse(400, { ok: false, error: 'Missing userName or userEmail' });
+      return jsonResponse(500, { ok: false, error: 'OpenPGP user id is not configured' });
     }
     const info = await loadPublicKey();
     let userId = `${userName} <${userEmail}>`;
@@ -818,7 +830,7 @@ async function handleHttp(event: any): Promise<APIGatewayProxyStructuredResultV2
     routeKey === 'GET /openpgp-public-key' ||
     (method === 'GET' && path === '/openpgp-public-key')
   ) {
-    return handleGetOpenPgpPublicKey(event);
+    return handleGetOpenPgpPublicKey();
   }
   return jsonResponse(404, { ok: false, error: 'Not found' });
 }

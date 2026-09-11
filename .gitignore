@@ -1,9 +1,23 @@
-# Private key material (GnuPG homes with secret keys and local pubkey exports)
+# Local GnuPG material (demo and leftover)
 /keys/
-
-# Signatures and extra artifacts written by the sign-and-verify testrun
+/keyring
 /test-out/
 /gpg-work/
+/demo/keys/
+/demo/keyring/
+/demo/test-out/
+
+# Built signer JAR (wrappers in dist/ are tracked)
+/dist/*.jar
+
+# Folder-based release stand-in
+/release/signing.pub.asc
+/release/artifacts/*
+!/release/artifacts/.gitkeep
+
+# Backend generated config
+kmsdirect/integration.env
+kmslambda/integration.env
 
 # kmslambda: downloaded deps and build output (lockfile package-lock.json is tracked)
 kmslambda/node_modules/
@@ -13,6 +27,7 @@ kmslambda/*.tsbuildinfo
 kmslambda/last-signing-request.json
 kmslambda/infra/.terraform/
 kmslambda/infra/backend.hcl
+kmslambda/infra/terraform.tfvars
 kmslambda/infra/tfplan
 kmslambda/infra/tfplan.json
 
@@ -20,4 +35,3 @@ kmslambda/infra/tfplan.json
 .DS_Store
 *.swp
 temp
-keyring
