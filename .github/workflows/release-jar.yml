@@ -22,7 +22,7 @@ jobs:
       KMSPGP_LAMBDA_API_BASE_URL: ${{ vars.KMSPGP_LAMBDA_API_BASE_URL }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set release metadata
         id: meta
@@ -32,7 +32,7 @@ jobs:
           echo "Release version: ${shortsha}"
 
       - name: Set up Java 25
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "25"
@@ -71,7 +71,7 @@ jobs:
           echo "Pinned public key fingerprint matches the live kmslambda key."
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v5
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -89,7 +89,7 @@ jobs:
             "dist/kmspgp-${{ steps.meta.outputs.shortsha }}.jar.asc"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: kmspgp-${{ steps.meta.outputs.shortsha }}
           name: kmspgp ${{ steps.meta.outputs.shortsha }}
