@@ -25,6 +25,16 @@ Once, for export and sign (not for verify). Wrappers in `dist/` call `kmspgp.jar
 ./kmspgp/build.sh
 ```
 
+## Signed releases
+
+This repo dogfoods the approval service: a manual GitHub Actions workflow builds `kmspgp-<shortsha>.jar`, signs it through kmslambda, and publishes the JAR plus detached signature as a [GitHub Release](https://github.com/chtz/gpg-kms/releases). The OpenPGP public key is pinned at [`keys/signing.pub.asc`](keys/signing.pub.asc). Setup (OIDC, IAM, GitHub Environment) is in [docs/github-actions.md](docs/github-actions.md).
+
+```bash
+gh release download kmspgp-SHORTSHA --pattern 'kmspgp-*'
+./verify.sh --pubkey keys/signing.pub.asc \
+  kmspgp-SHORTSHA.jar.asc kmspgp-SHORTSHA.jar
+```
+
 ## Direct KMS
 
 ### Admin: deploy and export

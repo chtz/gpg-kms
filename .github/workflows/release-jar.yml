@@ -1,0 +1,86 @@
+name: Release kmspgp.jar
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: write
+
+concurrency:
+  group: release-jar
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: release
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      KMSPGP_LAMBDA_FUNCTION_NAME: ${{ vars.KMSPGP_LAMBDA_FUNCTION_NAME }}
+      KMSPGP_LAMBDA_API_BASE_URL: ${{ vars.KMSPGP_LAMBDA_API_BASE_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set release metadata
+        id: meta
+        run: |
+          shortsha="$(git rev-parse --short HEAD)"
+          echo "shortsha=${shortsha}" >> "$GITHUB_OUTPUT"
+          echo "Release version: ${shortsha}"
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+
+      - name: Build kmspgp.jar
+        run: ./kmspgp/build.sh
+
+      - name: Name the release artifact
+        run: cp dist/kmspgp.jar "dist/kmspgp-${{ steps.meta.outputs.shortsha }}.jar"
+
+      - name: Check live public key matches pin
+        run: |
+          pinned="keys/signing.pub.asc"
+          live="$(mktemp)"
+          ./dist/lambda-export.sh --api "$KMSPGP_LAMBDA_API_BASE_URL" --out "$live"
+          if ! diff -u "$pinned" "$live"; then
+            echo "Live OpenPGP public key does not match ${pinned}." >&2
+            echo "Re-export and commit the pin after key rotation." >&2
+            exit 1
+          fi
+          echo "Pinned public key matches the live kmslambda export."
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-kmspgp-release
+
+      - name: Sign the JAR
+        run: |
+          echo "Waiting for kmslambda email approval (up to 30 minutes)."
+          ./dist/lambda-sign.sh \
+            --function "$KMSPGP_LAMBDA_FUNCTION_NAME" \
+            --api "$KMSPGP_LAMBDA_API_BASE_URL" \
+            --version "${{ steps.meta.outputs.shortsha }}" \
+            --environment github-release \
+            "dist/kmspgp-${{ steps.meta.outputs.shortsha }}.jar" \
+            "dist/kmspgp-${{ steps.meta.outputs.shortsha }}.jar.asc"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kmspgp-${{ steps.meta.outputs.shortsha }}
+          name: kmspgp ${{ steps.meta.outputs.shortsha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/kmspgp-${{ steps.meta.outputs.shortsha }}.jar
+            dist/kmspgp-${{ steps.meta.outputs.shortsha }}.jar.asc

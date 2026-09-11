@@ -1,0 +1,11 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InvokeSigningLambda",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": "__LAMBDA_FUNCTION_ARN__"
+    }
+  ]
+}

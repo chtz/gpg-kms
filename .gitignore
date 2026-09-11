@@ -1,5 +1,6 @@
 # Local GnuPG material (demo and leftover)
-/keys/
+/keys/*
+!/keys/signing.pub.asc
 /keyring
 /test-out/
 /gpg-work/
@@ -30,6 +31,9 @@ kmslambda/infra/backend.hcl
 kmslambda/infra/terraform.tfvars
 kmslambda/infra/tfplan
 kmslambda/infra/tfplan.json
+
+# GitHub Actions OIDC setup dumps (filled policies, local env)
+/github-actions/.local/
 
 # Editor / OS junk
 .DS_Store
