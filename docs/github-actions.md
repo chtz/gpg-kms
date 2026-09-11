@@ -71,7 +71,7 @@ git add keys/signing.pub.asc
 
 The armored file contains the OpenPGP User ID (public by design). It does not contain AWS account identifiers.
 
-The release workflow fetches the live `/openpgp-public-key` endpoint and **fails** if it does not match this file. After a rotation, commit the new pin before the next signed release.
+The release workflow fetches a live export and **fails** if its OpenPGP **fingerprint** differs from this file. Armor bytes are not compared: each export re-signs the self-certification with ECDSA, so the `.asc` text changes even when the key is the same. After a KMS key rotation, commit the new pin before the next signed release.
 
 ## 3. Create the GitHub OIDC IAM role
 
@@ -168,7 +168,7 @@ Deletes the IAM role and inline policy. Leaves the account-level GitHub OIDC pro
 | `Not authorized to perform sts:AssumeRoleWithWebIdentity` | Trust policy `sub` / `job_workflow_ref` mismatch: wrong repo, environment name, workflow path, or branch other than `main` |
 | `lambda:InvokeFunction` denied | Permissions policy ARN does not match the function the workflow invokes; re-run `setup-oidc-role.sh` after sourcing `config.sh` |
 | Job hits 40 minutes | Nobody approved; kmslambda poll timeout is 30 minutes |
-| `Live OpenPGP public key does not match` | KMS key was rotated and `keys/signing.pub.asc` was not updated |
+| `Live OpenPGP fingerprint does not match` | KMS key was rotated and `keys/signing.pub.asc` was not updated |
 | Release create fails with tag exists | That commit already has a Release; use a new commit or delete the tag only if you mean to re-sign |
 | `kmspgp.jar not found` | `./kmspgp/build.sh` did not run or Java/Maven is missing on the runner |
 

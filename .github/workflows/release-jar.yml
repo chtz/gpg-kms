@@ -46,15 +46,29 @@ jobs:
 
       - name: Check live public key matches pin
         run: |
+          # Armor bytes change on every export (ECDSA self-sig is non-deterministic).
+          # The pin is the same key iff fingerprints match.
+          fingerprint() {
+            gpg --batch --with-colons --show-keys "$1" \
+              | awk -F: '/^fpr:/{print toupper($10); exit}'
+          }
           pinned="keys/signing.pub.asc"
           live="$(mktemp)"
           ./dist/lambda-export.sh --api "$KMSPGP_LAMBDA_API_BASE_URL" --out "$live"
-          if ! diff -u "$pinned" "$live"; then
-            echo "Live OpenPGP public key does not match ${pinned}." >&2
+          pinned_fpr="$(fingerprint "$pinned")"
+          live_fpr="$(fingerprint "$live")"
+          if [[ -z "$pinned_fpr" || -z "$live_fpr" ]]; then
+            echo "Could not read OpenPGP fingerprint from pin or live export." >&2
+            exit 1
+          fi
+          echo "pinned: $pinned_fpr"
+          echo "live:   $live_fpr"
+          if [[ "$pinned_fpr" != "$live_fpr" ]]; then
+            echo "Live OpenPGP fingerprint does not match ${pinned}." >&2
             echo "Re-export and commit the pin after key rotation." >&2
             exit 1
           fi
-          echo "Pinned public key matches the live kmslambda export."
+          echo "Pinned public key fingerprint matches the live kmslambda key."
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
