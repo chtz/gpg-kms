@@ -5,6 +5,17 @@
 /test-out/
 /gpg-work/
 
+# kmslambda: downloaded deps and build output (lockfile package-lock.json is tracked)
+kmslambda/node_modules/
+kmslambda/dist/
+kmslambda/npm-debug.log*
+kmslambda/*.tsbuildinfo
+kmslambda/last-signing-request.json
+kmslambda/infra/.terraform/
+kmslambda/infra/backend.hcl
+kmslambda/infra/tfplan
+kmslambda/infra/tfplan.json
+
 # Editor / OS junk
 .DS_Store
 *.swp

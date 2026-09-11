@@ -1,0 +1,32 @@
+{
+  "name": "artifact-signing-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Serverless KMS-backed artifact signing service (approval via SNS, HTTP API for approval/status/public-key).",
+  "license": "MIT",
+  "type": "commonjs",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node22 --format=cjs --outfile=dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "prepare-terraform": "npm run build && mkdir -p dist && cd dist && zip -q -r lambda.zip index.js"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.130",
+    "@types/node": "^20.14.10",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.6.3"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.645.0",
+    "@aws-sdk/client-kms": "^3.645.0",
+    "@aws-sdk/client-sns": "^3.645.0",
+    "@aws-sdk/client-ssm": "^3.645.0",
+    "@aws-sdk/lib-dynamodb": "^3.645.0",
+    "ulid": "^2.3.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
+

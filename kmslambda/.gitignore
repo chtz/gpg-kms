@@ -1,0 +1,39 @@
+# Node
+node_modules/
+dist/
+.npm/
+npm-debug.log*
+package-lock.json.bak
+
+# TypeScript
+*.tsbuildinfo
+
+# Terraform (lockfile infra/.terraform.lock.hcl is tracked)
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+errored.tfstate
+override.tf
+override.tf.json
+terraform.tfvars
+terraform.tfvars.json
+*.auto.tfvars
+terraform.rc
+infra/backend.hcl
+infra/tfplan
+infra/tfplan.json
+
+# Script / test output
+last-signing-request.json
+testartifact.txt
+*.orig
+
+# Editor/OS
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
